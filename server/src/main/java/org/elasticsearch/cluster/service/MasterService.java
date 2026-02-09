@@ -72,7 +72,6 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ExecutorService;
-import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
@@ -111,6 +110,9 @@ public class MasterService extends AbstractLifecycleComponent {
 
     public static final String STATE_UPDATE_ACTION_NAME = "publish_cluster_state_update";
 
+    // Total metric count in {@link #registerMasterServiceMetrics()}: 3 aggregate gauges + their per-priority values.
+    private static final int MASTER_METRICS_COUNT = 3 + Priority.values().length * 3;
+
     private final ClusterStateTaskExecutor<ClusterStateUpdateTask> unbatchedExecutor;
 
     private ClusterStatePublisher clusterStatePublisher;
@@ -138,7 +140,7 @@ public class MasterService extends AbstractLifecycleComponent {
     private final Deque<ExecutionHistoryEntry> executionHistory;
 
     private final MeterRegistry meterRegistry;
-    private final List<Releasable> metricsToUnregister = new ArrayList<>(3 + Priority.values().length * 3);
+    private final List<Releasable> metricsToUnregister = new ArrayList<>(MASTER_METRICS_COUNT);
 
     public MasterService(
         Settings settings,
@@ -232,13 +234,13 @@ public class MasterService extends AbstractLifecycleComponent {
                 priorityPendingTasksMetricName(priority, "batches.current"),
                 "count",
                 "Current number of batches in the master's queue for priority " + priority,
-                () -> queuesByPriority.get(priority).queue.size()
+                () -> queuesByPriority.get(priority).queuedBatchCount.get()
             );
             registerLongGaugeMetric(
                 priorityPendingTasksMetricName(priority, "tasks.current"),
                 "count",
                 "Current number of tasks in the master's queue for priority " + priority,
-                () -> queuesByPriority.get(priority).totalQueuedTasksCount.get()
+                () -> queuesByPriority.get(priority).queuedTasksCount.get()
             );
         }
     }
@@ -740,7 +742,7 @@ public class MasterService extends AbstractLifecycleComponent {
     private int getTotalNumberOfTasksInQueues() {
         int taskCount = 0;
         for (final var queue : queuesByPriority.values()) {
-            taskCount += queue.totalQueuedTasksCount.get();
+            taskCount += queue.queuedTasksCount.get();
         }
         return taskCount;
     }
@@ -1525,6 +1527,7 @@ public class MasterService extends AbstractLifecycleComponent {
         for (final var queue : queuesByPriority.values()) {
             var batch = queue.queue.poll();
             if (batch != null) {
+                queue.queuedBatchCount.getAndDecrement();
                 currentlyExecutingBatch = batch;
                 if (executionHistory.isEmpty()
                     || executionHistory.peekFirst().incrementCountIfMatching(batch.queueName(), queue.priority) == false) {
@@ -1588,20 +1591,26 @@ public class MasterService extends AbstractLifecycleComponent {
      * There is one of these queues for each priority level.
      */
     private class PerPriorityQueue {
-        private final LinkedBlockingQueue<Batch> queue = new LinkedBlockingQueue<>();
+        private final ConcurrentLinkedQueue<Batch> queue = new ConcurrentLinkedQueue<>();
         private final Priority priority;
 
         /*
          * Tracks the total number of tasks currently in the queue, for metric purposes. In case of concurrent task submissions and batch
          * executions, this count may temporarily exceed the actual number of tasks in the queue, but will self-correct over time.
          */
-        private final AtomicInteger totalQueuedTasksCount = new AtomicInteger();
+        private final AtomicInteger queuedTasksCount = new AtomicInteger();
+        /*
+         * Tracks the number of batches currently in the queue, for metric purposes. In case of concurrent task submissions and batch
+         * executions, this count may temporarily exceed the actual number of batches in the queue, but will self-correct over time.
+         */
+        private final AtomicInteger queuedBatchCount = new AtomicInteger();
 
         PerPriorityQueue(Priority priority) {
             this.priority = priority;
         }
 
         void execute(Batch runner) {
+            queuedBatchCount.getAndIncrement();
             queue.add(runner);
             if (totalQueueSize.getAndIncrement() == 0) {
                 starvationWatcher.onEmptyQueue();
@@ -1834,7 +1843,7 @@ public class MasterService extends AbstractLifecycleComponent {
                 timeoutCancellable = null;
             }
 
-            perPriorityQueue.totalQueuedTasksCount.getAndIncrement();
+            perPriorityQueue.queuedTasksCount.getAndIncrement();
             queue.add(
                 new Entry<>(
                     source,
@@ -1894,7 +1903,7 @@ public class MasterService extends AbstractLifecycleComponent {
             @Override
             public void onRejection(NotMasterException e) {
                 final var items = queueSize.getAndSet(0);
-                perPriorityQueue.totalQueuedTasksCount.getAndAdd(-1 * items);
+                perPriorityQueue.queuedTasksCount.getAndAdd(-1 * items);
                 for (int i = 0; i < items; i++) {
                     final var entry = queue.poll();
                     assert entry != null;
@@ -1906,7 +1915,7 @@ public class MasterService extends AbstractLifecycleComponent {
             public void run(ActionListener<Void> listener) {
                 assert executing.isEmpty() : executing;
                 final var entryCount = queueSize.getAndSet(0);
-                perPriorityQueue.totalQueuedTasksCount.getAndAdd(-1 * entryCount);
+                perPriorityQueue.queuedTasksCount.getAndAdd(-1 * entryCount);
                 var taskCount = 0;
                 final var tasks = new ArrayList<ExecutionResult<T>>(entryCount);
                 for (int i = 0; i < entryCount; i++) {

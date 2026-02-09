@@ -1903,6 +1903,14 @@ public class MasterServiceTests extends ESTestCase {
         }
     }
 
+    /**
+     * Verifies MasterService starvation metrics (nonempty.time, tasks.current, batches.current).
+     * See {@link MasterService#registerMasterServiceMetrics()}.
+     * Simulates queue starvation by submitting an unbatched looping task and a randomly sized batch
+     * per priority, then gradually lowering the starvation level. The test runs in three phases:
+     * IMMEDIATE starves all others, then HIGH starves NORMAL and LOW, then the queue is drained.
+     * We assert the recorded gauges match the expected values at each stage.
+     */
     public void testStarvationMetrics() {
         final var deterministicTaskQueue = new DeterministicTaskQueue();
         deterministicTaskQueue.setExecutionDelayVariabilityMillis(between(0, 10_000));
@@ -1985,6 +1993,7 @@ public class MasterServiceTests extends ESTestCase {
 
             someTasksRunner.accept(between(2 /* make sure to run both the batch and looping task */, 10));
 
+            // Number of tasks in each batch + 1 looping task for each priority (except for LANGUID)
             final var totalTaskCount = batchSizePerPriority.values().stream().mapToInt(Integer::intValue).sum() + 5;
             final var immediateStarvingDuration = deterministicTaskQueue.getCurrentTimeMillis() - firstTaskExecutionTime.get();
             final var immediateStarvationTaskCount = totalTaskCount - batchSizePerPriority.get(Priority.IMMEDIATE);
