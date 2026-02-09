@@ -42,6 +42,7 @@ import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashSet;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Function;
 import java.util.stream.Collectors;
 
@@ -645,6 +646,38 @@ public class SnapshotsServiceTests extends ESTestCase {
             ),
             empty()
         );
+    }
+
+    public void testExternalChangesTaskSubmitsOnlyOnce() {
+        final var submittedTaskCount = new AtomicInteger(0);
+        final var task = new SnapshotsService.ExternalChangesTask((_source, _task, _timeout) -> submittedTaskCount.getAndIncrement());
+
+        for (int i = 0; i < randomIntBetween(1, 10); i++) {
+            task.processExternalChanges(true, false);
+            task.processExternalChanges(true, false);
+        }
+        assertThat(submittedTaskCount.get(), is(1));
+        assertThat(task.executeChanges(), is(SnapshotsService.ExternalChanges.NODES_ONLY));
+    }
+
+    public void testExternalChangesCorrectlyCombinesChanges() {
+        final var submittedTaskCount = new AtomicInteger(0);
+        final var task = new SnapshotsService.ExternalChangesTask((_source, _task, _timeout) -> submittedTaskCount.getAndIncrement());
+        for (int i = 0; i < 20; i++) {
+            submittedTaskCount.set(0);
+            boolean nodesChanged = randomBoolean();
+            boolean shardsChanged = randomBoolean();
+            task.processExternalChanges(nodesChanged, shardsChanged);
+            nodesChanged |= randomBoolean();
+            shardsChanged |= randomBoolean();
+            task.processExternalChanges(nodesChanged, shardsChanged);
+            assertThat(submittedTaskCount.get(), is(nodesChanged || shardsChanged ? 1 : 0));
+            assertThat(task.executeChanges(), is(SnapshotsService.ExternalChanges.of(nodesChanged, shardsChanged)));
+        }
+    }
+
+    public void testInterleavingExternalChangesAndExecution() throws Exception {
+        // wip
     }
 
     private static DiscoveryNodes discoveryNodes(String localNodeId) {
