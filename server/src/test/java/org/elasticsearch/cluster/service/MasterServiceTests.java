@@ -890,6 +890,7 @@ public class MasterServiceTests extends ESTestCase {
         final ThreadContext threadContext = threadPool.getThreadContext();
         final int taskCount = between(1, 10);
         final CountDownLatch taskCountDown = new CountDownLatch(taskCount);
+        final String expectedExceptionMessage = randomIdentifier("simulated-exception-");
 
         class Task implements ClusterStateTaskListener {
 
@@ -902,18 +903,63 @@ public class MasterServiceTests extends ESTestCase {
             @Override
             public void onFailure(Exception e) {
                 assertThat(e, instanceOf(RuntimeException.class));
-                assertThat(e.getMessage(), equalTo("simulated"));
+                assertThat(e.getMessage(), equalTo(expectedExceptionMessage));
                 assertThat(threadContext.getHeader(testContextHeaderName), equalTo(expectedHeaderValue));
                 taskCountDown.countDown();
             }
         }
 
+        final ClusterStateAckListener neverCalledAckListener = new ClusterStateAckListener() {
+            @Override
+            public boolean mustAck(DiscoveryNode discoveryNode) {
+                return fail(null, "should not call mustAck");
+            }
+
+            @Override
+            public void onAllNodesAcked() {
+                fail("should not call onAllNodesAcked");
+            }
+
+            @Override
+            public void onAckFailure(Exception e) {
+                fail("should not call onAckFailure");
+            }
+
+            @Override
+            public void onAckTimeout() {
+                fail("should not call onAckTimeout");
+            }
+
+            @Override
+            public TimeValue ackTimeout() {
+                return fail(null, "should not call ackTimeout");
+            }
+        };
+
         final ClusterStateTaskExecutor<Task> executor = batchExecutionContext -> {
             if (randomBoolean()) {
-                throw new RuntimeException("simulated");
+                for (final var taskContext : batchExecutionContext.taskContexts()) {
+                    // might have marked some, but not necessarily all, tasks as complete, but none of that matters
+                    switch (between(1, 10)) {
+                        case 1 -> taskContext.success(() -> fail("should not call plain success callback"));
+                        case 2 -> taskContext.success(neverCalledAckListener);
+                        case 3 -> taskContext.success(ignoredClusterState -> fail("should not call success callback"));
+                        case 4 -> taskContext.success(() -> fail("should not call success callback"), neverCalledAckListener);
+                        case 5 -> taskContext.success(
+                            ignoredClusterState -> fail("should not call success callback"),
+                            neverCalledAckListener
+                        );
+                        case 6 -> taskContext.onFailure(
+                            new RuntimeException(randomValueOtherThan(expectedExceptionMessage, ESTestCase::randomIdentifier))
+                        );
+                        default -> {
+                        }
+                    }
+                }
+                throw new RuntimeException(expectedExceptionMessage);
             } else {
                 for (final var taskContext : batchExecutionContext.taskContexts()) {
-                    taskContext.onFailure(new RuntimeException("simulated"));
+                    taskContext.onFailure(new RuntimeException(expectedExceptionMessage));
                 }
                 return batchExecutionContext.initialState();
             }
@@ -1903,6 +1949,14 @@ public class MasterServiceTests extends ESTestCase {
         }
     }
 
+    /**
+     * Verifies MasterService starvation metrics (nonempty.time, tasks.current, batches.current).
+     * See {@link MasterService#registerMasterServiceMetrics()}.
+     * Simulates queue starvation by submitting an unbatched looping task and a randomly sized batch
+     * per priority, then gradually lowering the starvation level. The test runs in three phases:
+     * IMMEDIATE starves all others, then HIGH starves NORMAL and LOW, then the queue is drained.
+     * We assert the recorded gauges match the expected values at each stage.
+     */
     public void testStarvationMetrics() {
         final var deterministicTaskQueue = new DeterministicTaskQueue();
         deterministicTaskQueue.setExecutionDelayVariabilityMillis(between(0, 10_000));
@@ -1927,8 +1981,17 @@ public class MasterServiceTests extends ESTestCase {
             final var firstTaskExecutionTime = new AtomicLong(Long.MIN_VALUE);
             final var lastTaskInsertionTime = new AtomicLong();
 
+            final EnumMap<Priority, Integer> batchSizePerPriority = new EnumMap<>(Priority.class);
+            final ClusterStateTaskExecutor<ClusterStateTaskListener> successExecutor = batchExecutionContext -> {
+                for (final var taskContext : batchExecutionContext.taskContexts()) {
+                    taskContext.success(() -> {});
+                }
+                return batchExecutionContext.initialState();
+            };
+
             for (final var priority : Priority.values()) {
                 if (priority == Priority.LANGUID) {
+                    batchSizePerPriority.put(priority, 0);
                     continue;
                 }
 
@@ -1955,6 +2018,15 @@ public class MasterServiceTests extends ESTestCase {
                     }
                 };
                 masterService.submitUnbatchedStateUpdateTask(taskName, loopingTask);
+
+                final var batchSize = randomIntBetween(1, 10);
+                final var batchQueue = masterService.createTaskQueue("success-noop-tasks-queue-" + priority, priority, successExecutor);
+                final var noopSuccessfulTask = new ExpectSuccessTask();
+
+                for (int i = 0; i < batchSize; i++) {
+                    batchQueue.submitTask("success-noop-task-" + priority + "-" + i, noopSuccessfulTask, null);
+                }
+                batchSizePerPriority.put(priority, batchSize);
             }
             final var oldestTaskInsertionTime = deterministicTaskQueue.getCurrentTimeMillis();
 
@@ -1966,30 +2038,35 @@ public class MasterServiceTests extends ESTestCase {
                 }
             };
 
-            someTasksRunner.accept(between(1, 5));
+            someTasksRunner.accept(between(2 /* make sure to run both the batch and looping task */, 10));
 
+            // Number of tasks in each batch + 1 looping task for each priority (except for LANGUID)
+            final var totalTaskCount = batchSizePerPriority.values().stream().mapToInt(Integer::intValue).sum() + 5;
             final var immediateStarvingDuration = deterministicTaskQueue.getCurrentTimeMillis() - firstTaskExecutionTime.get();
-            final var immediateMaxWaitTime = deterministicTaskQueue.getCurrentTimeMillis() - lastTaskInsertionTime.get();
-            final var immediateStarvingMaxWaitTime = deterministicTaskQueue.getCurrentTimeMillis() - oldestTaskInsertionTime;
+            final var immediateStarvationTaskCount = totalTaskCount - batchSizePerPriority.get(Priority.IMMEDIATE);
 
             assertStarvationMetrics(meterRegistry, "nonempty.time", immediateStarvingDuration, ignored -> immediateStarvingDuration);
-            assertStarvationMetrics(meterRegistry, "latency.time", immediateStarvingMaxWaitTime, priority -> {
-                if (priority == Priority.LANGUID) {
-                    return 0L;
-                }
-                if (priority == Priority.IMMEDIATE) {
-                    return immediateMaxWaitTime;
-                }
-                return immediateStarvingMaxWaitTime;
+            assertStarvationMetrics(meterRegistry, "nonempty.time", immediateStarvingDuration, ignored -> immediateStarvingDuration);
+            assertStarvationMetrics(meterRegistry, "tasks.current", immediateStarvationTaskCount, priority -> switch (priority) {
+                case LANGUID -> 0L;
+                case IMMEDIATE -> 1L;
+                default -> 1L + batchSizePerPriority.get(priority);
+            });
+            assertStarvationMetrics(meterRegistry, "batches.current", 9L, priority -> switch (priority) {
+                case LANGUID -> 0L;
+                case IMMEDIATE -> 1L;
+                default -> 2L;
             });
 
             starvingPriority.set(Priority.HIGH);
-            someTasksRunner.accept(2 /* must run the IMMEDIATE and URGENT tasks first */ + between(1, 5));
+            someTasksRunner.accept(2 /* must run the IMMEDIATE and URGENT tasks first */ + between(2, 10));
 
             final var highStarvingDuration = deterministicTaskQueue.getCurrentTimeMillis() - firstTaskExecutionTime.get();
             final var lastTaskDuration = deterministicTaskQueue.getCurrentTimeMillis() - lastTaskExecutionTime.get();
             final var highMaxWaitTime = deterministicTaskQueue.getCurrentTimeMillis() - lastTaskInsertionTime.get();
             final var highStarvingMaxWaitTime = deterministicTaskQueue.getCurrentTimeMillis() - oldestTaskInsertionTime;
+            final var highStarvationTaskCount = immediateStarvationTaskCount - batchSizePerPriority.get(Priority.URGENT)
+                - batchSizePerPriority.get(Priority.HIGH) - 2;
 
             assertStarvationMetrics(
                 meterRegistry,
@@ -2006,12 +2083,24 @@ public class MasterServiceTests extends ESTestCase {
                 }
                 return highStarvingMaxWaitTime;
             });
+            assertStarvationMetrics(meterRegistry, "tasks.current", highStarvationTaskCount, priority -> switch (priority) {
+                case LANGUID, IMMEDIATE, URGENT -> 0L;
+                case HIGH -> 1L;
+                default -> 1L + batchSizePerPriority.get(priority);
+            });
+            assertStarvationMetrics(meterRegistry, "batches.current", 5L, priority -> switch (priority) {
+                case LANGUID, IMMEDIATE, URGENT -> 0L;
+                case HIGH -> 1L;
+                default -> 2L;
+            });
 
             starvingPriority.set(Priority.LANGUID); // no more starvation
             deterministicTaskQueue.runAllTasks();
 
             assertStarvationMetrics(meterRegistry, "nonempty.time", 0L, ignored -> 0L);
             assertStarvationMetrics(meterRegistry, "latency.time", 0L, ignored -> 0L);
+            assertStarvationMetrics(meterRegistry, "tasks.current", 0L, ignored -> 0L);
+            assertStarvationMetrics(meterRegistry, "batches.current", 0L, ignored -> 0L);
         }
     }
 

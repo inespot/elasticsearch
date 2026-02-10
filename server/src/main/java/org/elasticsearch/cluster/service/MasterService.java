@@ -110,6 +110,9 @@ public class MasterService extends AbstractLifecycleComponent {
 
     public static final String STATE_UPDATE_ACTION_NAME = "publish_cluster_state_update";
 
+    // Total metric count in {@link #registerMasterServiceMetrics()}: 4 aggregate gauges + their per-priority values.
+    private static final int MASTER_METRICS_COUNT = 4 + Priority.values().length * 4;
+
     private final ClusterStateTaskExecutor<ClusterStateUpdateTask> unbatchedExecutor;
 
     private ClusterStatePublisher clusterStatePublisher;
@@ -137,7 +140,7 @@ public class MasterService extends AbstractLifecycleComponent {
     private final Deque<ExecutionHistoryEntry> executionHistory;
 
     private final MeterRegistry meterRegistry;
-    private final List<Releasable> metricsToUnregister = new ArrayList<>(2 + Priority.values().length * 2);
+    private final List<Releasable> metricsToUnregister = new ArrayList<>(MASTER_METRICS_COUNT);
 
     public MasterService(
         Settings settings,
@@ -213,6 +216,18 @@ public class MasterService extends AbstractLifecycleComponent {
             "Current max latency in milliseconds across all the master's task queues",
             this::getMaxQueueLatencyMillis
         );
+        registerLongGaugeMetric(
+            pendingTasksMetricName("batches.current"),
+            "count",
+            "Current number of batches across all the master's queues",
+            totalQueueSize::get
+        );
+        registerLongGaugeMetric(
+            pendingTasksMetricName("tasks.current"),
+            "count",
+            "Current number of tasks across all the master's queues",
+            this::getTotalNumberOfTasksInQueues
+        );
 
         for (var priority : Priority.values()) {
             registerLongGaugeMetric(
@@ -226,6 +241,18 @@ public class MasterService extends AbstractLifecycleComponent {
                 "milliseconds",
                 "Current max latency in milliseconds of the master's task queue for priority " + priority,
                 () -> queuesByPriority.get(priority).getQueueLatencyMillis(threadPool.relativeTimeInMillis())
+            );
+            registerLongGaugeMetric(
+                priorityPendingTasksMetricName(priority, "batches.current"),
+                "count",
+                "Current number of batches in the master's queue for priority " + priority,
+                () -> queuesByPriority.get(priority).queuedBatchCount.get()
+            );
+            registerLongGaugeMetric(
+                priorityPendingTasksMetricName(priority, "tasks.current"),
+                "count",
+                "Current number of tasks in the master's queue for priority " + priority,
+                () -> queuesByPriority.get(priority).queuedTasksCount.get()
             );
         }
     }
@@ -724,6 +751,14 @@ public class MasterService extends AbstractLifecycleComponent {
         return allBatchesStream().mapToInt(Batch::getPendingCount).sum();
     }
 
+    private int getTotalNumberOfTasksInQueues() {
+        int taskCount = 0;
+        for (final var queue : queuesByPriority.values()) {
+            taskCount += queue.queuedTasksCount.get();
+        }
+        return taskCount;
+    }
+
     /**
      * Returns the maximum wait time for tasks in the queue
      *
@@ -1068,6 +1103,7 @@ public class MasterService extends AbstractLifecycleComponent {
         void onBatchFailure(Exception failure) {
             // if the whole batch resulted in an exception then this overrides any task-level results whether successful or not
             this.failure = Objects.requireNonNull(failure);
+            this.onPublicationSuccess = null;
             this.publishedStateConsumer = null;
             this.clusterStateAckListener = null;
         }
@@ -1514,6 +1550,7 @@ public class MasterService extends AbstractLifecycleComponent {
         for (final var queue : queuesByPriority.values()) {
             var batch = queue.queue.poll();
             if (batch != null) {
+                queue.queuedBatchCount.getAndDecrement();
                 currentlyExecutingBatch = batch;
                 if (executionHistory.isEmpty()
                     || executionHistory.peekFirst().incrementCountIfMatching(batch.queueName(), queue.priority) == false) {
@@ -1580,11 +1617,23 @@ public class MasterService extends AbstractLifecycleComponent {
         private final ConcurrentLinkedQueue<Batch> queue = new ConcurrentLinkedQueue<>();
         private final Priority priority;
 
+        /*
+         * Tracks the total number of tasks currently in the queue, for metric purposes. In case of concurrent task submissions and batch
+         * executions, this count may temporarily exceed the actual number of tasks in the queue, but will self-correct over time.
+         */
+        private final AtomicInteger queuedTasksCount = new AtomicInteger();
+        /*
+         * Tracks the number of batches currently in the queue, for metric purposes. In case of concurrent task submissions and batch
+         * executions, this count may temporarily exceed the actual number of batches in the queue, but will self-correct over time.
+         */
+        private final AtomicInteger queuedBatchCount = new AtomicInteger();
+
         PerPriorityQueue(Priority priority) {
             this.priority = priority;
         }
 
         void execute(Batch runner) {
+            queuedBatchCount.getAndIncrement();
             queue.add(runner);
             if (totalQueueSize.getAndIncrement() == 0) {
                 starvationWatcher.onEmptyQueue();
@@ -1837,6 +1886,7 @@ public class MasterService extends AbstractLifecycleComponent {
                 timeoutCancellable = null;
             }
 
+            perPriorityQueue.queuedTasksCount.getAndIncrement();
             final var entry = new Entry<>(
                 source,
                 taskHolder,
@@ -1897,6 +1947,7 @@ public class MasterService extends AbstractLifecycleComponent {
             public void onRejection(NotMasterException e) {
                 oldestTaskInQueueMillis = Long.MAX_VALUE;
                 final var items = queueSize.getAndSet(0);
+                perPriorityQueue.queuedTasksCount.getAndAdd(-1 * items);
                 for (int i = 0; i < items; i++) {
                     final var entry = queue.poll();
                     assert entry != null;
@@ -1909,6 +1960,7 @@ public class MasterService extends AbstractLifecycleComponent {
                 assert executing.isEmpty() : executing;
                 oldestTaskInQueueMillis = Long.MAX_VALUE;
                 final var entryCount = queueSize.getAndSet(0);
+                perPriorityQueue.queuedTasksCount.getAndAdd(-1 * entryCount);
                 var taskCount = 0;
                 final var tasks = new ArrayList<ExecutionResult<T>>(entryCount);
                 for (int i = 0; i < entryCount; i++) {
