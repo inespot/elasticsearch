@@ -68,7 +68,6 @@ import org.elasticsearch.common.util.concurrent.AbstractRunnable;
 import org.elasticsearch.common.util.concurrent.EsExecutors;
 import org.elasticsearch.common.util.concurrent.EsRejectedExecutionException;
 import org.elasticsearch.common.util.concurrent.ListenableFuture;
-import org.elasticsearch.common.util.concurrent.RunOnce;
 import org.elasticsearch.core.Nullable;
 import org.elasticsearch.core.SuppressForbidden;
 import org.elasticsearch.core.Tuple;
@@ -856,10 +855,11 @@ public final class SnapshotsService extends AbstractLifecycleComponent implement
     private final class ExternalChangesTaskExecutor implements ClusterStateTaskExecutor<ExternalChangesTask> {
         @Override
         public ClusterState execute(BatchExecutionContext<ExternalChangesTask> batchExecutionContext) {
-            assert batchExecutionContext.taskContexts().size() == 1
-                : "Expected single ExternalChangesTask in the queue, but was " + batchExecutionContext.taskContexts().size();
+            final int numberOfTasksInBatch = batchExecutionContext.taskContexts().size();
+            assert numberOfTasksInBatch == 1 : "Expected single ExternalChangesTask in the queue, but was " + numberOfTasksInBatch;
 
-            final ExternalChanges changes = batchExecutionContext.taskContexts().get(0).getTask().executeChanges();
+            final TaskContext<ExternalChangesTask> task = batchExecutionContext.taskContexts().getFirst();
+            final ExternalChanges changes = task.getTask().executeChanges();
             final ClusterState currentState = batchExecutionContext.initialState();
             final SnapshotsInProgress snapshotsInProgress = SnapshotsInProgress.get(currentState);
             final SnapshotDeletionsInProgress deletesInProgress = SnapshotDeletionsInProgress.get(currentState);
@@ -999,10 +999,7 @@ public final class SnapshotsService extends AbstractLifecycleComponent implement
                 null
             ).v1();
 
-            Runnable successRunnable = new RunOnce(() -> clusterStateProcessed(res, finishedSnapshots));
-            for (TaskContext<ExternalChangesTask> taskContext : batchExecutionContext.taskContexts()) {
-                taskContext.success(successRunnable);
-            }
+            task.success(() -> clusterStateProcessed(res, finishedSnapshots));
             return res;
         }
 

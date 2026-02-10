@@ -10,8 +10,11 @@
 package org.elasticsearch.snapshots;
 
 import org.elasticsearch.action.support.ActionTestUtils;
+import org.elasticsearch.cluster.ClusterName;
 import org.elasticsearch.cluster.ClusterState;
+import org.elasticsearch.cluster.ClusterStateTaskExecutor;
 import org.elasticsearch.cluster.SnapshotsInProgress;
+import org.elasticsearch.cluster.block.ClusterBlocks;
 import org.elasticsearch.cluster.metadata.IndexMetadata;
 import org.elasticsearch.cluster.metadata.Metadata;
 import org.elasticsearch.cluster.node.DiscoveryNodeRole;
@@ -26,32 +29,49 @@ import org.elasticsearch.cluster.routing.ShardRoutingState;
 import org.elasticsearch.cluster.routing.TestShardRouting;
 import org.elasticsearch.cluster.routing.UnassignedInfo;
 import org.elasticsearch.cluster.service.ClusterStateTaskExecutorUtils;
+import org.elasticsearch.cluster.service.MasterService;
+import org.elasticsearch.cluster.version.CompatibilityVersionsUtils;
+import org.elasticsearch.common.Priority;
 import org.elasticsearch.common.UUIDs;
+import org.elasticsearch.common.settings.ClusterSettings;
 import org.elasticsearch.common.settings.Settings;
 import org.elasticsearch.common.unit.ByteSizeValue;
+import org.elasticsearch.common.util.concurrent.DeterministicTaskQueue;
+import org.elasticsearch.common.util.concurrent.StoppableExecutorServiceWrapper;
 import org.elasticsearch.index.Index;
 import org.elasticsearch.index.IndexVersion;
 import org.elasticsearch.index.shard.ShardId;
+import org.elasticsearch.node.Node;
 import org.elasticsearch.repositories.IndexId;
 import org.elasticsearch.repositories.RepositoryShardId;
 import org.elasticsearch.repositories.ShardGeneration;
 import org.elasticsearch.repositories.ShardSnapshotResult;
+import org.elasticsearch.tasks.TaskManager;
+import org.elasticsearch.telemetry.metric.MeterRegistry;
+import org.elasticsearch.test.ClusterServiceUtils;
 import org.elasticsearch.test.ESTestCase;
 
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Function;
 import java.util.stream.Collectors;
 
+import static java.util.Collections.emptySet;
 import static java.util.Collections.singleton;
 import static org.elasticsearch.cluster.metadata.IndexMetadata.SETTING_VERSION_CREATED;
 import static org.hamcrest.Matchers.empty;
 import static org.hamcrest.Matchers.is;
 
 public class SnapshotsServiceTests extends ESTestCase {
+
+    private ClusterStateTaskExecutor.TaskContext<SnapshotsService.ExternalChangesTask> taskContext;
 
     public void testNoopShardStateUpdates() throws Exception {
         final String repoName = "test-repo";
@@ -668,16 +688,141 @@ public class SnapshotsServiceTests extends ESTestCase {
             boolean nodesChanged = randomBoolean();
             boolean shardsChanged = randomBoolean();
             task.processExternalChanges(nodesChanged, shardsChanged);
-            nodesChanged |= randomBoolean();
-            shardsChanged |= randomBoolean();
-            task.processExternalChanges(nodesChanged, shardsChanged);
+            for (int j = 0; j < randomIntBetween(0, 2); j++) {
+                nodesChanged |= randomBoolean();
+                shardsChanged |= randomBoolean();
+                task.processExternalChanges(nodesChanged, shardsChanged);
+            }
             assertThat(submittedTaskCount.get(), is(nodesChanged || shardsChanged ? 1 : 0));
             assertThat(task.executeChanges(), is(SnapshotsService.ExternalChanges.of(nodesChanged, shardsChanged)));
         }
     }
 
-    public void testInterleavingExternalChangesAndExecution() throws Exception {
-        // wip
+    public void testInterleavingExternalChangesAndExecution() {
+        final var deterministicTaskQueue = new DeterministicTaskQueue();
+        final var threadPool = deterministicTaskQueue.getThreadPool();
+        final var localNode = DiscoveryNodeUtils.builder("node1").roles(new HashSet<>(DiscoveryNodeRole.roles())).build();
+        final var settings = Settings.builder()
+            .put(ClusterName.CLUSTER_NAME_SETTING.getKey(), "test")
+            .put(Node.NODE_NAME_SETTING.getKey(), "test_node")
+            .build();
+
+        final var executedChanges = new ArrayList<SnapshotsService.ExternalChanges>();
+
+        final ClusterStateTaskExecutor<SnapshotsService.ExternalChangesTask> executor = batchContext -> {
+            assertThat("at most one ExternalChangesTask in the queue at any time", batchContext.taskContexts().size(), is(1));
+            final var taskContext = batchContext.taskContexts().getFirst();
+            executedChanges.add(taskContext.getTask().executeChanges());
+            taskContext.success(() -> {});
+            return batchContext.initialState();
+        };
+
+        try (
+            var masterService = new MasterService(
+                settings,
+                new ClusterSettings(settings, ClusterSettings.BUILT_IN_CLUSTER_SETTINGS),
+                threadPool,
+                new TaskManager(settings, threadPool, emptySet()),
+                MeterRegistry.NOOP
+            ) {
+                @Override
+                protected ExecutorService createThreadPoolExecutor() {
+                    return new StoppableExecutorServiceWrapper(threadPool.generic());
+                }
+            }
+        ) {
+            final var initialState = ClusterState.builder(new ClusterName("external-tasks-test"))
+                .nodes(DiscoveryNodes.builder().add(localNode).localNodeId(localNode.getId()).masterNodeId(localNode.getId()))
+                .putCompatibilityVersions(localNode.getId(), CompatibilityVersionsUtils.staticCurrent())
+                .blocks(ClusterBlocks.EMPTY_CLUSTER_BLOCK)
+                .build();
+            final var clusterStateRef = new AtomicReference<>(initialState);
+
+            masterService.setClusterStatePublisher((e, pl, al) -> {
+                ClusterServiceUtils.setAllElapsedMillis(e);
+                clusterStateRef.set(e.getNewState());
+                threadPool.generic().execute(() -> pl.onResponse(null));
+            });
+            masterService.setClusterStateSupplier(clusterStateRef::get);
+            masterService.start();
+
+            final var queue = masterService.createTaskQueue("snapshots-service-external-change", Priority.NORMAL, executor);
+            final var task = new SnapshotsService.ExternalChangesTask(queue);
+
+            threadPool.getThreadContext().markAsSystemContext();
+
+            // Interleave: submit changes, run tasks, submit more changes, run again
+            task.processExternalChanges(true, false);
+            assertThat(masterService.numberOfPendingTasks(), is(1));
+            deterministicTaskQueue.runAllRunnableTasks();
+            assertThat(executedChanges, is(List.of(SnapshotsService.ExternalChanges.NODES_ONLY)));
+
+            task.processExternalChanges(false, true);
+            assertThat(masterService.numberOfPendingTasks(), is(1));
+            deterministicTaskQueue.runAllRunnableTasks();
+            assertThat(
+                executedChanges,
+                is(List.of(SnapshotsService.ExternalChanges.NODES_ONLY, SnapshotsService.ExternalChanges.SHARDS_ONLY))
+            );
+            executedChanges.clear();
+
+            // Multiple rapid changes before execution - should still be single task.
+            // Randomize number of submissions, (nodes, shards) values, and interleaving of execution vs submission.
+            final var expectedChanges = new ArrayList<SnapshotsService.ExternalChanges>();
+
+            boolean batchNodes = false;
+            boolean batchShards = false;
+            final int steps = between(20, 60);
+            for (int i = 0; i < steps; i++) {
+                if (randomBoolean()) {
+                    // Submit one more change with random values
+                    boolean nodes = randomBoolean();
+                    boolean shards = randomBoolean();
+                    if (nodes || shards) {
+                        batchNodes |= nodes;
+                        batchShards |= shards;
+                        task.processExternalChanges(nodes, shards);
+                    }
+                } else {
+                    // Run batch: expected result is the combined changes since last run
+                    if (batchNodes || batchShards) {
+                        assertThat(masterService.numberOfPendingTasks(), is(1));
+                        expectedChanges.add(SnapshotsService.ExternalChanges.of(batchNodes, batchShards));
+                        batchNodes = false;
+                        batchShards = false;
+                    } else {
+                        assertThat(masterService.numberOfPendingTasks(), is(0));
+                    }
+                    deterministicTaskQueue.runAllRunnableTasks();
+                }
+            }
+            if (batchNodes || batchShards) {
+                expectedChanges.add(SnapshotsService.ExternalChanges.of(batchNodes, batchShards));
+                deterministicTaskQueue.runAllRunnableTasks();
+            }
+            assertThat(
+                "executed changes should match expected queue (combined ExternalChanges per batch run)",
+                executedChanges,
+                is(expectedChanges)
+            );
+        }
+    }
+
+    public void testExternalChangesTaskExtractsChangesCorrectlyWhenExecuted() throws Exception {
+        final var state = ClusterState.builder(ClusterState.EMPTY_STATE).nodes(discoveryNodes(uuid())).build();
+        final var task = new SnapshotsService.ExternalChangesTask((_s, _t, _to) -> {});
+        task.processExternalChanges(true, false);
+
+        final ClusterStateTaskExecutor<SnapshotsService.ExternalChangesTask> executor = batchContext -> {
+            final var changes = batchContext.taskContexts().getFirst().getTask().executeChanges();
+            assertThat(changes.changedNodes(), is(true));
+            assertThat(changes.changedShards(), is(false));
+            batchContext.taskContexts().forEach(tc -> tc.success(() -> {}));
+            return batchContext.initialState();
+        };
+
+        final var result = ClusterStateTaskExecutorUtils.executeAndAssertSuccessful(state, executor, List.of(task));
+        assertSame(state, result);
     }
 
     private static DiscoveryNodes discoveryNodes(String localNodeId) {
