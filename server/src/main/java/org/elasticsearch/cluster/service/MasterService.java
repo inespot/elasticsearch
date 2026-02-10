@@ -1839,7 +1839,6 @@ public class MasterService extends AbstractLifecycleComponent {
         private final ConcurrentLinkedQueue<Entry<T>> queue = new ConcurrentLinkedQueue<>();
         private final ConcurrentLinkedQueue<Entry<T>> executing = new ConcurrentLinkedQueue<>(); // executing tasks are also shown in APIs
         private final AtomicInteger queueSize = new AtomicInteger();
-        private volatile long oldestTaskInQueueMillis = Long.MAX_VALUE; // does not consider executing tasks
         private final String name;
         private final BatchConsumer<T> batchConsumer;
         private final LongSupplier insertionIndexSupplier;
@@ -1898,7 +1897,6 @@ public class MasterService extends AbstractLifecycleComponent {
             queue.add(entry);
 
             if (queueSize.getAndIncrement() == 0) {
-                oldestTaskInQueueMillis = entry.insertionTimeMillis();
                 perPriorityQueue.execute(processor);
             }
         }
@@ -1945,7 +1943,6 @@ public class MasterService extends AbstractLifecycleComponent {
         private class Processor implements Batch {
             @Override
             public void onRejection(NotMasterException e) {
-                oldestTaskInQueueMillis = Long.MAX_VALUE;
                 final var items = queueSize.getAndSet(0);
                 perPriorityQueue.queuedTasksCount.getAndAdd(-1 * items);
                 for (int i = 0; i < items; i++) {
@@ -1958,7 +1955,6 @@ public class MasterService extends AbstractLifecycleComponent {
             @Override
             public void run(ActionListener<Void> listener) {
                 assert executing.isEmpty() : executing;
-                oldestTaskInQueueMillis = Long.MAX_VALUE;
                 final var entryCount = queueSize.getAndSet(0);
                 perPriorityQueue.queuedTasksCount.getAndAdd(-1 * entryCount);
                 var taskCount = 0;
@@ -2043,7 +2039,11 @@ public class MasterService extends AbstractLifecycleComponent {
 
             @Override
             public long getOldestTaskInQueueMillis() {
-                return oldestTaskInQueueMillis;
+                final var task = queue.peek();
+                if (task == null) {
+                    return Long.MAX_VALUE;
+                }
+                return task.insertionTimeMillis();
             }
 
             @Override
