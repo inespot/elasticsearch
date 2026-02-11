@@ -72,8 +72,6 @@ import static org.hamcrest.Matchers.not;
 
 public class SnapshotsServiceTests extends ESTestCase {
 
-    private ClusterStateTaskExecutor.TaskContext<SnapshotsService.ExternalChangesTask> taskContext;
-
     public void testNoopShardStateUpdates() throws Exception {
         final String repoName = "test-repo";
         final Snapshot snapshot = snapshot(repoName, "snapshot-1");
