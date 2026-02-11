@@ -772,12 +772,10 @@ public final class SnapshotsService extends AbstractLifecycleComponent implement
 
     /**
      * A cluster state task that updates in-progress snapshots when external cluster changes occur (e.g. master fail-over, node removal, or
-     * shards that were waiting for snapshot becoming available). The task is deduplicated at this level: the same instance is reused and
-     * re-submitted to the master queue, and we only enqueue when no execution is already pending. As a result, there is at most one
-     * {@link ExternalChangesTask} in the batch queue at any time, with all changes since the last execution accumulated in
+     * shards that were waiting for snapshot becoming available). The task is deduplicated: we only enqueue when no execution is already
+     * pending, so there is at most one {@link ExternalChangesTask} in the batch queue at any time, with changes accumulated in
      * {@link #externalChanges}.
      */
-
     static final class ExternalChangesTask implements ClusterStateTaskListener {
         private final MasterServiceTaskQueue<ExternalChangesTask> masterQueue;
         private ExternalChanges externalChanges = ExternalChanges.NO_CHANGES;
@@ -789,13 +787,12 @@ public final class SnapshotsService extends AbstractLifecycleComponent implement
 
         public void processExternalChanges(boolean changedNodes, boolean changedShards) {
             if (changedNodes == false && changedShards == false) {
-                // nothing to do, no relevant external change happened
                 return;
             }
             boolean enqueueTask = false;
             synchronized (this) {
-                this.externalChanges = ExternalChanges.combine(externalChanges, ExternalChanges.of(changedNodes, changedShards));
-                if (externalChanges != ExternalChanges.NO_CHANGES && awaitingExecution == false) {
+                externalChanges = ExternalChanges.combine(externalChanges, ExternalChanges.of(changedNodes, changedShards));
+                if (awaitingExecution == false) {
                     awaitingExecution = true;
                     enqueueTask = true;
                 }
@@ -806,7 +803,6 @@ public final class SnapshotsService extends AbstractLifecycleComponent implement
         }
 
         public synchronized ExternalChanges executeChanges() {
-            awaitingExecution = false;
             final var changesToExecute = externalChanges;
             externalChanges = ExternalChanges.NO_CHANGES;
             return changesToExecute;
@@ -815,6 +811,25 @@ public final class SnapshotsService extends AbstractLifecycleComponent implement
         @Override
         public void onFailure(Exception e) {
             logger.warn("Failed to update snapshot state after shards or node configuration changed", e);
+            resubmitTaskIfPendingChanges();
+        }
+
+        public void onSuccess() {
+            resubmitTaskIfPendingChanges();
+        }
+
+        private void resubmitTaskIfPendingChanges() {
+            boolean enqueueTask = false;
+            synchronized (this) {
+                if (externalChanges != ExternalChanges.NO_CHANGES) {
+                    enqueueTask = true;
+                } else {
+                    awaitingExecution = false;
+                }
+            }
+            if (enqueueTask) {
+                masterQueue.submitTask("Update snapshot after shards or node configuration changed", this, null);
+            }
         }
     }
 
@@ -999,7 +1014,10 @@ public final class SnapshotsService extends AbstractLifecycleComponent implement
                 null
             ).v1();
 
-            task.success(() -> clusterStateProcessed(res, finishedSnapshots));
+            task.success(() -> {
+                task.getTask().onSuccess();
+                clusterStateProcessed(res, finishedSnapshots);
+            });
             return res;
         }
 

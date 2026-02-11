@@ -50,15 +50,15 @@ import org.elasticsearch.tasks.TaskManager;
 import org.elasticsearch.telemetry.metric.MeterRegistry;
 import org.elasticsearch.test.ClusterServiceUtils;
 import org.elasticsearch.test.ESTestCase;
+import org.elasticsearch.threadpool.ThreadPool;
 
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashSet;
-import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ExecutorService;
-import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Function;
 import java.util.stream.Collectors;
@@ -68,6 +68,7 @@ import static java.util.Collections.singleton;
 import static org.elasticsearch.cluster.metadata.IndexMetadata.SETTING_VERSION_CREATED;
 import static org.hamcrest.Matchers.empty;
 import static org.hamcrest.Matchers.is;
+import static org.hamcrest.Matchers.not;
 
 public class SnapshotsServiceTests extends ESTestCase {
 
@@ -668,114 +669,28 @@ public class SnapshotsServiceTests extends ESTestCase {
         );
     }
 
-    public void testExternalChangesTaskSubmitsOnlyOnce() {
-        final var submittedTaskCount = new AtomicInteger(0);
-        final var task = new SnapshotsService.ExternalChangesTask((_source, _task, _timeout) -> submittedTaskCount.getAndIncrement());
-
-        for (int i = 0; i < randomIntBetween(1, 10); i++) {
-            task.processExternalChanges(true, false);
-            task.processExternalChanges(true, false);
-        }
-        assertThat(submittedTaskCount.get(), is(1));
-        assertThat(task.executeChanges(), is(SnapshotsService.ExternalChanges.NODES_ONLY));
-    }
-
-    public void testExternalChangesCorrectlyCombinesChanges() {
-        final var submittedTaskCount = new AtomicInteger(0);
-        final var task = new SnapshotsService.ExternalChangesTask((_source, _task, _timeout) -> submittedTaskCount.getAndIncrement());
-        for (int i = 0; i < 20; i++) {
-            submittedTaskCount.set(0);
-            boolean nodesChanged = randomBoolean();
-            boolean shardsChanged = randomBoolean();
-            task.processExternalChanges(nodesChanged, shardsChanged);
-            for (int j = 0; j < randomIntBetween(0, 2); j++) {
-                nodesChanged |= randomBoolean();
-                shardsChanged |= randomBoolean();
-                task.processExternalChanges(nodesChanged, shardsChanged);
-            }
-            assertThat(submittedTaskCount.get(), is(nodesChanged || shardsChanged ? 1 : 0));
-            assertThat(task.executeChanges(), is(SnapshotsService.ExternalChanges.of(nodesChanged, shardsChanged)));
-        }
-    }
-
-    public void testInterleavingExternalChangesAndExecution() {
+    public void testExternalChangesSubmissionAndExecution() {
         final var deterministicTaskQueue = new DeterministicTaskQueue();
         final var threadPool = deterministicTaskQueue.getThreadPool();
-        final var localNode = DiscoveryNodeUtils.builder("node1").roles(new HashSet<>(DiscoveryNodeRole.roles())).build();
-        final var settings = Settings.builder()
-            .put(ClusterName.CLUSTER_NAME_SETTING.getKey(), "test")
-            .put(Node.NODE_NAME_SETTING.getKey(), "test_node")
-            .build();
-
         final var executedChanges = new ArrayList<SnapshotsService.ExternalChanges>();
-
         final ClusterStateTaskExecutor<SnapshotsService.ExternalChangesTask> executor = batchContext -> {
             assertThat("at most one ExternalChangesTask in the queue at any time", batchContext.taskContexts().size(), is(1));
             final var taskContext = batchContext.taskContexts().getFirst();
             executedChanges.add(taskContext.getTask().executeChanges());
-            taskContext.success(() -> {});
+            taskContext.success(() -> taskContext.getTask().onSuccess());
             return batchContext.initialState();
         };
 
-        try (
-            var masterService = new MasterService(
-                settings,
-                new ClusterSettings(settings, ClusterSettings.BUILT_IN_CLUSTER_SETTINGS),
-                threadPool,
-                new TaskManager(settings, threadPool, emptySet()),
-                MeterRegistry.NOOP
-            ) {
-                @Override
-                protected ExecutorService createThreadPoolExecutor() {
-                    return new StoppableExecutorServiceWrapper(threadPool.generic());
-                }
-            }
-        ) {
-            final var initialState = ClusterState.builder(new ClusterName("external-tasks-test"))
-                .nodes(DiscoveryNodes.builder().add(localNode).localNodeId(localNode.getId()).masterNodeId(localNode.getId()))
-                .putCompatibilityVersions(localNode.getId(), CompatibilityVersionsUtils.staticCurrent())
-                .blocks(ClusterBlocks.EMPTY_CLUSTER_BLOCK)
-                .build();
-            final var clusterStateRef = new AtomicReference<>(initialState);
-
-            masterService.setClusterStatePublisher((e, pl, al) -> {
-                ClusterServiceUtils.setAllElapsedMillis(e);
-                clusterStateRef.set(e.getNewState());
-                threadPool.generic().execute(() -> pl.onResponse(null));
-            });
-            masterService.setClusterStateSupplier(clusterStateRef::get);
-            masterService.start();
-
+        try (var masterService = createMasterService(threadPool)) {
             final var queue = masterService.createTaskQueue("snapshots-service-external-change", Priority.NORMAL, executor);
             final var task = new SnapshotsService.ExternalChangesTask(queue);
 
-            threadPool.getThreadContext().markAsSystemContext();
-
-            // Interleave: submit changes, run tasks, submit more changes, run again
-            task.processExternalChanges(true, false);
-            assertThat(masterService.numberOfPendingTasks(), is(1));
-            deterministicTaskQueue.runAllRunnableTasks();
-            assertThat(executedChanges, is(List.of(SnapshotsService.ExternalChanges.NODES_ONLY)));
-
-            task.processExternalChanges(false, true);
-            assertThat(masterService.numberOfPendingTasks(), is(1));
-            deterministicTaskQueue.runAllRunnableTasks();
-            assertThat(
-                executedChanges,
-                is(List.of(SnapshotsService.ExternalChanges.NODES_ONLY, SnapshotsService.ExternalChanges.SHARDS_ONLY))
-            );
-            executedChanges.clear();
-
-            // Multiple rapid changes before execution - should still be single task.
-            // Randomize number of submissions, (nodes, shards) values, and interleaving of execution vs submission.
+            // Randomized interleaving of external tasks execution and submission.
             final var expectedChanges = new ArrayList<SnapshotsService.ExternalChanges>();
-
             boolean batchNodes = false;
             boolean batchShards = false;
-            final int steps = between(20, 60);
-            for (int i = 0; i < steps; i++) {
+            for (int i = 0; i < 30; i++) {
                 if (randomBoolean()) {
-                    // Submit one more change with random values
                     boolean nodes = randomBoolean();
                     boolean shards = randomBoolean();
                     if (nodes || shards) {
@@ -784,21 +699,23 @@ public class SnapshotsServiceTests extends ESTestCase {
                         task.processExternalChanges(nodes, shards);
                     }
                 } else {
-                    // Run batch: expected result is the combined changes since last run
                     if (batchNodes || batchShards) {
                         assertThat(masterService.numberOfPendingTasks(), is(1));
                         expectedChanges.add(SnapshotsService.ExternalChanges.of(batchNodes, batchShards));
+                        deterministicTaskQueue.runRandomTask();
                         batchNodes = false;
                         batchShards = false;
                     } else {
                         assertThat(masterService.numberOfPendingTasks(), is(0));
                     }
-                    deterministicTaskQueue.runAllRunnableTasks();
                 }
             }
             if (batchNodes || batchShards) {
                 expectedChanges.add(SnapshotsService.ExternalChanges.of(batchNodes, batchShards));
                 deterministicTaskQueue.runAllRunnableTasks();
+                // No more changes, empty queue
+                assertThat(masterService.numberOfPendingTasks(), is(0));
+                assertThat(task.executeChanges(), is(SnapshotsService.ExternalChanges.NO_CHANGES));
             }
             assertThat(
                 "executed changes should match expected queue (combined ExternalChanges per batch run)",
@@ -808,21 +725,86 @@ public class SnapshotsServiceTests extends ESTestCase {
         }
     }
 
-    public void testExternalChangesTaskExtractsChangesCorrectlyWhenExecuted() throws Exception {
-        final var state = ClusterState.builder(ClusterState.EMPTY_STATE).nodes(discoveryNodes(uuid())).build();
-        final var task = new SnapshotsService.ExternalChangesTask((_s, _t, _to) -> {});
-        task.processExternalChanges(true, false);
+    public void testExternalChangesTaskReSubmissionOnSuccessAndFailure() {
+        final var deterministicTaskQueue = new DeterministicTaskQueue();
+        final var threadPool = deterministicTaskQueue.getThreadPool();
+        final var taskFailedBeforeExecution = new AtomicBoolean(false);
+        final var concurrentModification = new AtomicBoolean(false);
 
         final ClusterStateTaskExecutor<SnapshotsService.ExternalChangesTask> executor = batchContext -> {
-            final var changes = batchContext.taskContexts().getFirst().getTask().executeChanges();
-            assertThat(changes.changedNodes(), is(true));
-            assertThat(changes.changedShards(), is(false));
-            batchContext.taskContexts().forEach(tc -> tc.success(() -> {}));
+            taskFailedBeforeExecution.set(false);
+            concurrentModification.set(false);
+            assertThat("at most one ExternalChangesTask in the queue at any time", batchContext.taskContexts().size(), is(1));
+            final var taskContext = batchContext.taskContexts().getFirst();
+            if (randomBoolean()) {
+                taskFailedBeforeExecution.set(true);
+                throw new RuntimeException("simulated executor failure before execution");
+            }
+            taskContext.getTask().executeChanges();
+            if (randomBoolean()) {
+                final var newChanges = SnapshotsService.ExternalChanges.of(randomBoolean(), randomBoolean());
+                taskContext.getTask().processExternalChanges(newChanges.changedNodes(), newChanges.changedShards());
+                concurrentModification.set(newChanges != SnapshotsService.ExternalChanges.NO_CHANGES);
+            }
+            if (randomBoolean()) {
+                throw new RuntimeException("simulated publication failure");
+            } else {
+                taskContext.success(() -> taskContext.getTask().onSuccess());
+            }
             return batchContext.initialState();
         };
 
-        final var result = ClusterStateTaskExecutorUtils.executeAndAssertSuccessful(state, executor, List.of(task));
-        assertSame(state, result);
+        try (var masterService = createMasterService(threadPool)) {
+            final var queue = masterService.createTaskQueue("snapshots-service-external-change", Priority.NORMAL, executor);
+            final var task = new SnapshotsService.ExternalChangesTask(queue);
+            task.processExternalChanges(true, true);
+            for (int i = 0; i < 30; i++) {
+                deterministicTaskQueue.runRandomTask();
+                if (taskFailedBeforeExecution.get() || concurrentModification.get()) {
+                    assertThat(masterService.numberOfPendingTasks(), is(1));
+                    assertThat(task.executeChanges(), not(SnapshotsService.ExternalChanges.NO_CHANGES));
+                } else {
+                    assertThat(masterService.numberOfPendingTasks(), is(0));
+                    assertThat(task.executeChanges(), is(SnapshotsService.ExternalChanges.NO_CHANGES));
+                }
+                task.processExternalChanges(true, false);
+            }
+        }
+    }
+
+    private static MasterService createMasterService(ThreadPool threadPool) {
+        final var localNode = DiscoveryNodeUtils.builder("node1").roles(new HashSet<>(DiscoveryNodeRole.roles())).build();
+        final var settings = Settings.builder()
+            .put(ClusterName.CLUSTER_NAME_SETTING.getKey(), "test")
+            .put(Node.NODE_NAME_SETTING.getKey(), "test_node")
+            .build();
+        final var masterService = new MasterService(
+            settings,
+            new ClusterSettings(settings, ClusterSettings.BUILT_IN_CLUSTER_SETTINGS),
+            threadPool,
+            new TaskManager(settings, threadPool, emptySet()),
+            MeterRegistry.NOOP
+        ) {
+            @Override
+            protected ExecutorService createThreadPoolExecutor() {
+                return new StoppableExecutorServiceWrapper(threadPool.generic());
+            }
+        };
+        final var initialState = ClusterState.builder(new ClusterName("external-tasks-test"))
+            .nodes(DiscoveryNodes.builder().add(localNode).localNodeId(localNode.getId()).masterNodeId(localNode.getId()))
+            .putCompatibilityVersions(localNode.getId(), CompatibilityVersionsUtils.staticCurrent())
+            .blocks(ClusterBlocks.EMPTY_CLUSTER_BLOCK)
+            .build();
+        final var clusterStateRef = new AtomicReference<>(initialState);
+        masterService.setClusterStatePublisher((e, pl, al) -> {
+            ClusterServiceUtils.setAllElapsedMillis(e);
+            clusterStateRef.set(e.getNewState());
+            threadPool.generic().execute(() -> pl.onResponse(null));
+        });
+        masterService.setClusterStateSupplier(clusterStateRef::get);
+        masterService.start();
+        threadPool.getThreadContext().markAsSystemContext();
+        return masterService;
     }
 
     private static DiscoveryNodes discoveryNodes(String localNodeId) {
