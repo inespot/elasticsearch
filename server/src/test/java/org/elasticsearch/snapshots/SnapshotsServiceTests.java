@@ -13,8 +13,10 @@ import org.elasticsearch.action.support.ActionTestUtils;
 import org.elasticsearch.cluster.ClusterName;
 import org.elasticsearch.cluster.ClusterState;
 import org.elasticsearch.cluster.ClusterStateTaskExecutor;
+import org.elasticsearch.cluster.NotMasterException;
 import org.elasticsearch.cluster.SnapshotsInProgress;
 import org.elasticsearch.cluster.block.ClusterBlocks;
+import org.elasticsearch.cluster.coordination.FailedToCommitClusterStateException;
 import org.elasticsearch.cluster.metadata.IndexMetadata;
 import org.elasticsearch.cluster.metadata.Metadata;
 import org.elasticsearch.cluster.node.DiscoveryNodeRole;
@@ -726,17 +728,25 @@ public class SnapshotsServiceTests extends ESTestCase {
     public void testExternalChangesTaskReSubmissionOnSuccessAndFailure() {
         final var deterministicTaskQueue = new DeterministicTaskQueue();
         final var threadPool = deterministicTaskQueue.getThreadPool();
-        final var taskFailedBeforeExecution = new AtomicBoolean(false);
+        final var executorFailedEarly = new AtomicBoolean(false);
+        final var masterFailed = new AtomicBoolean(false);
         final var concurrentModification = new AtomicBoolean(false);
 
         final ClusterStateTaskExecutor<SnapshotsService.ExternalChangesTask> executor = batchContext -> {
-            taskFailedBeforeExecution.set(false);
+            executorFailedEarly.set(false);
+            masterFailed.set(false);
             concurrentModification.set(false);
             assertThat("at most one ExternalChangesTask in the queue at any time", batchContext.taskContexts().size(), is(1));
             final var taskContext = batchContext.taskContexts().getFirst();
             if (randomBoolean()) {
-                taskFailedBeforeExecution.set(true);
-                throw new RuntimeException("simulated executor failure before execution");
+                executorFailedEarly.set(true);
+                final var failure = randomFrom(
+                    new NotMasterException("simulated no longer master"),
+                    new FailedToCommitClusterStateException("simulated failed to commit failure"),
+                    new RuntimeException("simulated random pre-execution failure")
+                );
+                masterFailed.set(failure instanceof NotMasterException || failure instanceof FailedToCommitClusterStateException);
+                throw failure;
             }
             taskContext.getTask().executeChanges();
             if (randomBoolean()) {
@@ -758,7 +768,15 @@ public class SnapshotsServiceTests extends ESTestCase {
             task.processExternalChanges(true, true);
             for (int i = 0; i < 30; i++) {
                 deterministicTaskQueue.runRandomTask();
-                if (taskFailedBeforeExecution.get() || concurrentModification.get()) {
+                if (executorFailedEarly.get()) {
+                    if (masterFailed.get()) {
+                        assertThat(masterService.numberOfPendingTasks(), is(0));
+                        assertThat(task.executeChanges(), is(SnapshotsService.ExternalChanges.NO_CHANGES));
+                    } else {
+                        assertThat(masterService.numberOfPendingTasks(), is(1));
+                        assertThat(task.executeChanges(), not(SnapshotsService.ExternalChanges.NO_CHANGES));
+                    }
+                } else if (concurrentModification.get()) {
                     assertThat(masterService.numberOfPendingTasks(), is(1));
                     assertThat(task.executeChanges(), not(SnapshotsService.ExternalChanges.NO_CHANGES));
                 } else {

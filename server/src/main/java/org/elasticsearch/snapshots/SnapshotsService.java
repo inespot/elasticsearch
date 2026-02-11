@@ -810,6 +810,14 @@ public final class SnapshotsService extends AbstractLifecycleComponent implement
 
         @Override
         public void onFailure(Exception e) {
+            if (e instanceof NotMasterException || e instanceof FailedToCommitClusterStateException) {
+                // has lost mastership, don't resubmit and wipe
+                synchronized (this) {
+                    externalChanges = ExternalChanges.NO_CHANGES;
+                    awaitingExecution = false;
+                }
+                return;
+            }
             logger.warn("Failed to update snapshot state after shards or node configuration changed", e);
             resubmitTaskIfPendingChanges();
         }
