@@ -267,13 +267,174 @@ to communicate with Elasticsearch.
 
 (A node can coordinate a search across several other nodes, when the node itself does not have the data, and then return a result to the caller. Explain this coordinating role)
 
+### Cluster State
+
+[ClusterState]:https://github.com/elastic/elasticsearch/blob/main/server/src/main/java/org/elasticsearch/cluster/ClusterState.java
+
+[Metadata]:https://github.com/elastic/elasticsearch/blob/main/server/src/main/java/org/elasticsearch/cluster/metadata/Metadata.java
+
+[ProjectMetadata]:https://github.com/elastic/elasticsearch/blob/main/server/src/main/java/org/elasticsearch/cluster/metadata/ProjectMetadata.java
+
+The [Metadata] of a [ClusterState] is persisted on disk and comprises
+information from two categories:
+
+1. Cluster scope information such as `clusterUUID`, `CoordinationMetadata`
+2. Project scope information ([ProjectMetadata]) such as indices and templates
+   belong to each project.
+
+Some concepts are applicable to both cluster and project scopes,
+e.g. [persistent tasks](#persistent-tasks). The state of a persistent task is
+therefore stored accordingly depending on the task's scope.
+
+#### Master Service
+
+#### Cluster State Publication
+
+(Majority concensus to apply, what happens if a master-eligible node falls
+behind / is incommunicado.)
+
+#### Cluster State Application
+
+(Go over the two kinds of listeners -- ClusterStateApplier and
+ClusterStateListener?)
+
+#### Persistence
+
+(Sketch ephemeral vs persisted cluster state.)
+
+(what's the format for persisted metadata)
+
 ### Node Roles
 
 ### Master Nodes
 
 ### Master Elections
 
-(Quorum, terms, any eligibility limitations)
+[Coordinator]:https://github.com/elastic/elasticsearch/blob/main/server/src/main/java/org/elasticsearch/cluster/coordination/Coordinator.java
+
+[CoordinationState]:https://github.com/elastic/elasticsearch/blob/main/server/src/main/java/org/elasticsearch/cluster/coordination/CoordinationState.java
+
+[Join]:https://github.com/elastic/elasticsearch/blob/main/server/src/main/java/org/elasticsearch/cluster/coordination/Join.java
+
+[JoinRequest]:https://github.com/elastic/elasticsearch/blob/main/server/src/main/java/org/elasticsearch/cluster/coordination/JoinRequest.java
+
+[CoordinationMetadata]:https://github.com/elastic/elasticsearch/blob/main/server/src/main/java/org/elasticsearch/cluster/coordination/CoordinationMetadata.java
+
+[Reconfigurator]:https://github.com/elastic/elasticsearch/blob/main/server/src/main/java/org/elasticsearch/cluster/coordination/Reconfigurator.java
+
+The cluster maintains at most a single active master at all times. If no master
+is present, the cluster will not be able to commit any [ClusterState] changes
+until one is elected.
+
+To elect a master, Elasticsearch uses a Paxos-inspired consensus
+algorithm. It is formally defined in a TLA+ specification referenced
+from the [CoordinationState] class. The [Coordinator] class handles the core
+logic of the
+election, and manages how nodes transition between `CANDIDATE`, `LEADER`, and
+`FOLLOWER` [modes](https://github.com/elastic/elasticsearch/blob/v9.3.0/server/src/main/java/org/elasticsearch/cluster/coordination/Coordinator.java#L1794).
+
+The [CoordinationMetadata] instance stored in [ClusterState]::[Metadata],
+tracks the coordination-related state needed for subsequent master
+elections.
+
+#### Quorum
+
+An election needs a strict majority, defined by
+`votedNodesCount * 2 > nodeIds.size()`,
+of the nodes in *both* [CoordinationMetadata]'s `lastCommittedConfiguration` and
+`lastAcceptedConfiguration`
+[voting configurations](https://github.com/elastic/elasticsearch/blob/v9.3.0/server/src/main/java/org/elasticsearch/cluster/coordination/CoordinationMetadata.java#L326)
+to succeed.
+Using both configurations is
+necessary to guarantee safety during
+[voting configuration changes](https://www.elastic.co/docs/deploy-manage/distributed-architecture/discovery-cluster-formation/modules-discovery-voting#_voting_configuration_updates).
+
+The full quorum check is performed
+by [ElectionStrategy#isElectionQuorum()](https://github.com/elastic/elasticsearch/blob/v9.3.0/server/src/main/java/org/elasticsearch/cluster/coordination/ElectionStrategy.java#L52).
+
+#### Node Eligibility
+
+Only master-eligible nodes can trigger, participate and vote in elections. A
+node
+is master-eligible if
+its [node.roles](https://www.elastic.co/docs/deploy-manage/distributed-architecture/clusters-nodes-shards/node-roles#set-node-roles)
+config field has the `master` role (included by default), which is
+internally represented by the `DiscoveryNodeRole.MASTER_ROLE`.
+
+A `CANDIDATE` node may only win an election if it appears in at least one of the
+`lastCommittedConfiguration` or `lastAcceptedConfiguration`, and is not
+explicitly excluded via
+a [VotingConfigExclusion](https://github.com/elastic/elasticsearch/blob/v9.3.0/server/src/main/java/org/elasticsearch/cluster/coordination/CoordinationMetadata.java#L232).
+This is enforced
+by [ElectionStrategy#nodeMayWinElection()](https://github.com/elastic/elasticsearch/blob/v9.3.0/server/src/main/java/org/elasticsearch/cluster/coordination/ElectionStrategy.java#L120).
+Voting config exclusions are used during planned master node retirement (e.g.,
+via the voting config exclusions API) to prevent a departing node from winning
+elections during the transition.
+The [Reconfigurator] computes optimal voting configurations as the set of
+master-eligible nodes changes.
+
+#### Terms
+
+Every election takes place in a
+numbered [term](https://github.com/elastic/elasticsearch/blob/main/server/src/main/java/org/elasticsearch/cluster/coordination/CoordinationMetadata.java#L36).
+Terms are monotonically increasing `long` that act as logical clocks for the
+coordination layer. They are persisted (
+via [CoordinationState.PersistedState](https://github.com/elastic/elasticsearch/blob/v9.3.0/server/src/main/java/org/elasticsearch/cluster/coordination/CoordinationState.java#L42))
+so that a node never votes in the same term twice, even across restarts.
+
+When a `CANDIDATE` starts a new election, it computes the next term as
+`max(currentTerm, maxTermSeen) + 1` (see
+[Coordinator#getTermForNewElection()](https://github.com/elastic/elasticsearch/blob/v9.3.0/server/src/main/java/org/elasticsearch/cluster/coordination/Coordinator.java#L551)).
+The `maxTermSeen` value is updated
+whenever the node observes a higher term from pre-vote responses, join requests,
+or published cluster states. A node that
+receives a [StartJoinRequest] with a higher term than its own will update its
+persisted term and cast its vote (a [Join]) for the requesting candidate in that
+term.
+
+#### Election Flow Overview
+
+An election happens in two phases:
+
+- the [pre-vote](https://davecturner.github.io/2017/08/17/paxos-pre-voting.html)
+  phase: ensures liveness and does not incur any state changes.
+- the join phase: the real election that bumps the term.
+
+For a successful election, the overall flow looks like this:
+
+```
+1. Leader failure detected (LeaderChecker) or startup
+        |
+        v
+2. Master-eligible node becomes CANDIDATE
+        |
+        v
+3. PeerFinder discovers peers
+        |
+        v
+4. Enough peers for quorum? --> Start ElectionScheduler
+        |
+        v
+5. ElectionScheduler fires --> Pre-vote round (PreVoteCollector)
+        |
+        v
+6. Pre-vote quorum reached? --> startElection()
+        |
+        v
+7. Broadcast StartJoinRequest to all discovered nodes (new term)
+        |
+        v
+8. Nodes respond with Join votes
+        |
+        v
+9. Join quorum reached? --> becomeLeader()
+```
+
+#### Phase 1: Pre-Voting
+
+#### Phase 2: Join (Actual Election)
+
+#### Leader Failure Detection
 
 ### Cluster Formation / Membership
 
@@ -282,34 +443,6 @@ to communicate with Elasticsearch.
 #### Discovery
 
 ### Master Transport Actions
-
-### Cluster State
-
-[ClusterState]:https://github.com/elastic/elasticsearch/blob/main/server/src/main/java/org/elasticsearch/cluster/ClusterState.java
-[Metadata]:https://github.com/elastic/elasticsearch/blob/main/server/src/main/java/org/elasticsearch/cluster/metadata/Metadata.java
-[ProjectMetadata]:https://github.com/elastic/elasticsearch/blob/main/server/src/main/java/org/elasticsearch/cluster/metadata/ProjectMetadata.java
-
-The [Metadata] of a [ClusterState] is persisted on disk and comprises information from two categories:
-1. Cluster scope information such as `clusterUUID`, `CoordinationMetadata`
-2. Project scope information ([ProjectMetadata]) such as indices and templates belong to each project.
-
-Some concepts are applicable to both cluster and project scopes, e.g. [persistent tasks](#persistent-tasks). The state of a persistent task is therefore stored accordingly depending on the task's scope.
-
-#### Master Service
-
-#### Cluster State Publication
-
-(Majority concensus to apply, what happens if a master-eligible node falls behind / is incommunicado.)
-
-#### Cluster State Application
-
-(Go over the two kinds of listeners -- ClusterStateApplier and ClusterStateListener?)
-
-#### Persistence
-
-(Sketch ephemeral vs persisted cluster state.)
-
-(what's the format for persisted metadata)
 
 # Replication
 
