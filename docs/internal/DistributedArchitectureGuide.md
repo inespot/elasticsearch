@@ -281,8 +281,6 @@ Some concepts are applicable to both cluster and project scopes, e.g. [persisten
 
 ### Node Roles
 
-### Master Nodes
-
 ### Master Elections
 
 [Coordinator]:https://github.com/elastic/elasticsearch/blob/main/server/src/main/java/org/elasticsearch/cluster/coordination/Coordinator.java
@@ -295,10 +293,14 @@ Some concepts are applicable to both cluster and project scopes, e.g. [persisten
 
 [CoordinationMetadata]:https://github.com/elastic/elasticsearch/blob/main/server/src/main/java/org/elasticsearch/cluster/coordination/CoordinationMetadata.java
 
-The cluster maintains at most a single active master at all times. If no master is present, the cluster will not be able
-to commit any [ClusterState] changes until one is elected.
+[VotingConfiguration]: https://github.com/elastic/elasticsearch/blob/v9.3.0/server/src/main/java/org/elasticsearch/cluster/coordination/CoordinationMetadata.java#L326
 
-To elect a master, Elasticsearch uses a Paxos-inspired consensus algorithm. It is formally defined in a TLA+
+The cluster maintains *at most* a single active master at all times. If no master is present, master-eligible nodes will
+attempt to become the master by starting an election. The cluster will not be able to commit any [ClusterState] changes
+until a new master is elected.
+
+To elect a master, Elasticsearch uses a consensus algorithm derived
+from [Paxos](https://lamport.azurewebsites.net/pubs/lamport-paxos.pdf). This algorithm is formally defined in a TLA+
 specification referenced from the [CoordinationState] class. The [Coordinator] class handles the core logic of the
 election, and manages how nodes transition between `CANDIDATE`, `LEADER`, and
 `FOLLOWER` [modes](https://github.com/elastic/elasticsearch/blob/v9.3.0/server/src/main/java/org/elasticsearch/cluster/coordination/Coordinator.java#L1794).
@@ -308,145 +310,145 @@ for subsequent master elections.
 
 #### Quorum
 
-An election needs a strict majority, defined by `votedNodesCount * 2 > nodeIds.size()`, of the nodes in
-*both* [CoordinationMetadata]'s `lastCommittedConfiguration` and
-`lastAcceptedConfiguration` [voting configurations](https://github.com/elastic/elasticsearch/blob/v9.3.0/server/src/main/java/org/elasticsearch/cluster/coordination/CoordinationMetadata.java#L326)
-to succeed. Using both configurations is necessary to guarantee safety
+A quorum is defined as a strict majority `(votedNodesCount * 2 > nodeIds.size())` of the nodes listed in
+a [VotingConfiguration]. [CoordinationMetadata] maintains two such configurations: `lastCommittedConfiguration` and
+`lastAcceptedConfiguration`. Recording both is necessary to guarantee safety
 during [voting configuration changes](https://www.elastic.co/docs/deploy-manage/distributed-architecture/discovery-cluster-formation/modules-discovery-voting#_voting_configuration_updates).
-
-The full quorum check is performed
-by [ElectionStrategy#isElectionQuorum()](https://github.com/elastic/elasticsearch/blob/v9.3.0/server/src/main/java/org/elasticsearch/cluster/coordination/ElectionStrategy.java#L52).
-
-#### Node Eligibility
-
-[VotingConfigExclusion]: https://github.com/elastic/elasticsearch/blob/v9.3.0/server/src/main/java/org/elasticsearch/cluster/coordination/CoordinationMetadata.java#L232
-
-[Reconfigurator]:https://github.com/elastic/elasticsearch/blob/main/server/src/main/java/org/elasticsearch/cluster/coordination/Reconfigurator.java
-
-Only master-eligible nodes can trigger, participate and vote in elections. A node is master-eligible if
-its [node.roles](https://www.elastic.co/docs/deploy-manage/distributed-architecture/clusters-nodes-shards/node-roles#set-node-roles)
-config field has the `master` role (included by default), which is internally represented by the
-`DiscoveryNodeRole.MASTER_ROLE`.
-
-A `CANDIDATE` node may only win an election if it appears in at least one of the `lastCommittedConfiguration` or
-`lastAcceptedConfiguration`, and is not explicitly excluded via a [VotingConfigExclusion]. This is enforced
-by [ElectionStrategy#nodeMayWinElection()](https://github.com/elastic/elasticsearch/blob/v9.3.0/server/src/main/java/org/elasticsearch/cluster/coordination/ElectionStrategy.java#L120).
-Voting config exclusions are used during planned master node retirement (e.g., via the voting config exclusions API) to
-prevent a departing node from winning elections during the transition.
-The [Reconfigurator] computes optimal voting configurations as the set of master-eligible nodes changes.
 
 #### Terms
 
 Every election takes place in a
 numbered [term](https://github.com/elastic/elasticsearch/blob/main/server/src/main/java/org/elasticsearch/cluster/coordination/CoordinationMetadata.java#L36).
-Terms are monotonically increasing `long` that act as logical clocks for the coordination layer. They are persisted (
-via [CoordinationState.PersistedState](https://github.com/elastic/elasticsearch/blob/v9.3.0/server/src/main/java/org/elasticsearch/cluster/coordination/CoordinationState.java#L42))
-so that a node never votes in the same term twice, even across restarts.
+Terms are monotonically increasing `long` that act as logical clocks for the coordination layer, allowing the cluster to
+distinguish between master mandates coming from distinct elections. They are persisted (
+via [CoordinationState.PersistedState](https://github.com/elastic/elasticsearch/blob/v9.3.0/server/src/main/java/org/elasticsearch/cluster/coordination/CoordinationState.java#L42)).
+A term can have at most one master. A node will never vote in the same term twice.
 
-When a `CANDIDATE` starts a new election, it computes the next term as `max(currentTerm, maxTermSeen) + 1` (
-see [Coordinator#getTermForNewElection()](https://github.com/elastic/elasticsearch/blob/v9.3.0/server/src/main/java/org/elasticsearch/cluster/coordination/Coordinator.java#L551)).
-The `maxTermSeen` value is updated whenever the node observes a higher term from pre-vote responses, join requests, or
-published cluster states. A node that receives a [StartJoinRequest] with a higher term than its own will update its
-persisted term and cast its vote (a [Join]) for the requesting candidate in that term.
+#### Election Flow
 
-#### Election Flow Overview
-
-An election happens in two phases:
-
-- the [pre-vote](https://davecturner.github.io/2017/08/17/paxos-pre-voting.html) phase: ensures liveness and does not
-  incur any state changes.
-- the join phase: the real election that bumps the term.
-
-For a successful election, the overall flow looks like this:
+The overall election flow looks like this:
 
 ```
- ┌─────────────────────────────────────────────┬──────────────────────────────────┐
- │                  STEPS                      │      MAIN CODE COMPONENTS        │
- ╞═════════════════════════════════════════════╪══════════════════════════════════╡
- │  1. Leader Failure Detected                 │  LeaderChecker                   │
- │                                             │  Coordinator.becomeCandidate()   │
- │  Follower detects heartbeat timeout from    │                                  │
- │  the current master node.                   │                                  │
- └─────────────────────────────────────────────┴──────────────────────────────────┘
-                                │
-                                ▼
- ┌─────────────────────────────────────────────┬──────────────────────────────────┐
- │  2. Become CANDIDATE                        │  Coordinator.becomeCandidate()   │
- │                                             │  Mode.CANDIDATE                  │
- │  Node transitions to CANDIDATE mode.        │                                  │
- │  Clears known master, cancels publications. │                                  │
- └─────────────────────────────────────────────┴──────────────────────────────────┘
-                                │
-                                ▼
- ┌─────────────────────────────────────────────┬──────────────────────────────────┐
- │  3. Peer Discovery                          │  PeerFinder                      │
- │                                             │  PeerFinder.handleWakeUp()       │
- │  Re-probes known master nodes from last     │                                  │
- │  accepted cluster state AND configured      │  lastAcceptedNodes               │
- │  seed_hosts (as fallback), in parallel.     │   .getMasterNodes()              │
- │                                             │  configuredHostsResolver         │
- └─────────────────────────────────────────────┴──────────────────────────────────┘
-                                │
-                                ▼
- ┌─────────────────────────────────────────────┬──────────────────────────────────┐
- │  4. Quorum Peers Check                      │  ElectionScheduler               │
- │                                             │  CoordinatorPeerFinder           │
- │  Are enough peers discovered to form a      │   .onFoundPeersUpdated()         │
- │  quorum? If yes, start election scheduler.  │                                  │
- └─────────────────────────────────────────────┴──────────────────────────────────┘
-                                │
-                                ▼
- ┌─────────────────────────────────────────────┬──────────────────────────────────┐
- │  5. Pre-Vote Round                          │  PreVoteCollector                │
- │                                             │  PreVoteRequest                  │
- │  Scheduler fires. Sends pre-vote requests   │  PreVoteResponse                 │
- │  to peers. No state changes occur here.     │                                  │
- └─────────────────────────────────────────────┴──────────────────────────────────┘
-                                │
-                                ▼
- ┌─────────────────────────────────────────────┬──────────────────────────────────┐
- │  6. Pre-Vote Quorum Reached                 │  PreVoteCollector                │
- │                                             │   → startElection()              │
- │  Enough pre-vote responses received?        │  Coordinator.startElection()     │
- │  Proceed to the real election.              │                                  │
- └─────────────────────────────────────────────┴──────────────────────────────────┘
-                                │
-                                ▼
- ┌─────────────────────────────────────────────┬──────────────────────────────────┐
- │  7. Broadcast StartJoinRequest              │  StartJoinRequest                │
- │                                             │  Coordinator                     │
- │  Computes new term: max(current, seen) + 1  │   .broadcastStartJoinRequest()   │
- │  Sends StartJoinRequest to all known nodes. │  getTermForNewElection()         │
- └─────────────────────────────────────────────┴──────────────────────────────────┘
-                                │
-                                ▼
- ┌─────────────────────────────────────────────┬──────────────────────────────────┐
- │  8. Nodes Respond with Join Votes           │  Join                            │
- │                                             │  JoinRequest                     │
- │  Each node bumps its persisted term and     │  JoinHelper                      │
- │  casts a vote (Join) for the candidate.     │  CoordinationState.handleJoin()  │
- └─────────────────────────────────────────────┴──────────────────────────────────┘
-                                │
-                                ▼
- ┌─────────────────────────────────────────────┬──────────────────────────────────┐
- │  9. Join Quorum → Become Leader             │  Coordinator.becomeLeader()      │
- │                                             │  ElectionStrategy                │
- │  Quorum reached in both voting configs?     │   .isElectionQuorum()            │
- │  Node becomes LEADER and publishes state.   │  Mode.LEADER                     │
- └─────────────────────────────────────────────┴──────────────────────────────────┘
+    ┌───────────────────────────────────────────────┬──────────────────────────────────┐
+    │                     STEPS                     │       MAIN CODE COMPONENTS       │
+    ╞═══════════════════════════════════════════════╪══════════════════════════════════╡
+    │  1. Leader Failure Detected                   │  LeaderChecker                   │
+    │                                               │  Coordinator.onLeaderFailure()   │
+    │  Follower detects current master failure.     │                                  │
+    └───────────────────────────────────────────────┴──────────────────────────────────┘
+                                                    │
+                                                    ▼
+    ┌───────────────────────────────────────────────┬──────────────────────────────────┐
+    │  2. Master-eligible node becomes `CANDIDATE`  │  Coordinator.becomeCandidate()   │
+    │                                               │  Mode.CANDIDATE                  │
+    │  Follower transitions to `CANDIDATE` mode.    │  PeerFinder.activate(...)        │
+    │  Triggers the discovery process.              │                                  │
+    └───────────────────────────────────────────────┴──────────────────────────────────┘
+                                                    │
+                                                    ▼
+    ┌───────────────────────────────────────────────┬──────────────────────────────────┐
+    │  3. Peer Discovery                            │  PeerFinder.handleWakeUp()       │
+    │                                               │  ConfiguredHostsResolver         │
+    │  Candidate probes master-eligible nodes from  │  PeerFinder.startProbe(...)      │
+    │  lastAcceptedState & ConfiguredHostsResolver. │  PeersRequest                    │
+    │  Asks if there is a current master and what   │  PeersResponse                   │
+    │  other master-eligible nodes are in the       │                                  │
+    │  cluster.                                     │                                  │
+    └───────────────────────────────────────────────┴──────────────────────────────────┘
+                                                    │
+                                                    ▼
+    ┌───────────────────────────────────────────────┬──────────────────────────────────┐
+    │  4. Candidate schedules election              │  CoordinatorPeerFinder           │
+    │                                               │    .onFoundPeersUpdated()        │
+    │  No current master + enough master-           │  Coordinator                     │
+    │  eligible peers discovered to form a quorum?  │    .startElectionScheduler()     │
+    │  If yes, candidate schedules election (with   │  ElectionScheduler               │
+    │  randomized backoff to minimize conflicts     │    .scheduleNextElection()       │
+    │  with other potential candidates).            │                                  │
+    └───────────────────────────────────────────────┴──────────────────────────────────┘
+                                                    │
+                                                    ▼
+    ┌───────────────────────────────────────────────┬──────────────────────────────────┐
+    │  5. Pre-Vote Round                            │  NodeEligibility                 │
+    │                                               │  PreVoteCollector.start(...)     │
+    │  Election starts. Candidate double checks it  │  PreVoteResponse                 │
+    │  is healthy and eligible to be master.        │                                  │
+    │  Candidate sends pre-vote requests to         │                                  │
+    │  master-eligible peers.                       │                                  │
+    └───────────────────────────────────────────────┴──────────────────────────────────┘
+                                                    │
+                                                    ▼
+    ┌───────────────────────────────────────────────┬──────────────────────────────────┐
+    │  6. Pre-Vote Quorum Reached                   │  ElectionStrategy                │
+    │                                               │    .isElectionQuorum(...)        │
+    │  Enough pre-vote responses received?          │  Coordinator.startElection()     │
+    │  Proceed to the real election.                │                                  │
+    └───────────────────────────────────────────────┴──────────────────────────────────┘
+                                                    │
+                                                    ▼
+    ┌───────────────────────────────────────────────┬──────────────────────────────────┐
+    │  7. Candidate bumps term                      │  Coordinator                     │
+    │           & broadcasts StartJoinRequest       │    .getTermForNewElection()      │
+    │                                               │  Coordinator                     │
+    │  Computes new term: max(current, seen) + 1.   │    .broadcastStartJoinRequest(..)│
+    │  Sends StartJoinRequest with new term to all  │  StartJoinRequest                │
+    │  nodes discovered in previous step.           │                                  │
+    └───────────────────────────────────────────────┴──────────────────────────────────┘
+                                                    │
+                                                    ▼
+    ┌───────────────────────────────────────────────┬──────────────────────────────────┐
+    │  8. Other nodes start the Join process        │  CoordinationState               │
+    │                                               │    .handleStartJoin(...)         │
+    │  Master-eligible node acks the                │  CoordinationState               │
+    │  StartJoinRequest, persists the latest term,  │    .setCurrentTerm(...)          │
+    │  verifies it's healthy enough to cast a vote, │  JoinHelper                      │
+    │  and sends a JoinRequest to the candidate.    │    .sendJoinRequest(...)         │
+    └───────────────────────────────────────────────┴──────────────────────────────────┘
+                                                    │
+                                                    ▼
+    ┌───────────────────────────────────────────────┬──────────────────────────────────┐
+    │  9. Candidate becomes `LEADER`                │  Coordinator                     │
+    │                                               │    .processJoinRequest(...)      │
+    │  Enough JoinRequest received to satisfy       │  CoordinationState.handleJoin(..)│
+    │  quorum? Candidate becomes LEADER.            │  ElectionStrategy                │
+    │                                               │    .isElectionQuorum(...)        │
+    │                                               │  Coordinator.becomeLeader()      │
+    │                                               │  Mode.LEADER                     │
+    └───────────────────────────────────────────────┴──────────────────────────────────┘
+                                                    │
+                                                    ▼
+    ┌───────────────────────────────────────────────┬──────────────────────────────────┐
+    │  10. Leader completes election                 │  CandidateJoinAccumulator        │
+    │                                               │    .close(...)                   │
+    │  Leader publishes state, cleans up discovery  │  JoinTask                        │
+    │  connections, starts heartbeating.            │  LeaderHeartbeatService          │
+    │                                               │    .start(...)                   │
+    └───────────────────────────────────────────────┴──────────────────────────────────┘
 ```
-
-- **Phase 1: Pre-Voting**
-
-TODO
-
-- **Phase 2: Join (Actual Election)**
-
-TODO
 
 #### Leader Failure Detection
 
-#### Master Service
+(LeaderChecker and FollowerChecker)
+
+#### Discovery
+
+(Describe the "fast gossip" discovery process and how connections are handled)
+
+#### Pre-Vote
+
+https://davecturner.github.io/2017/08/17/paxos-pre-voting.html
+(Explain why the pre-voting phase is essential to ensure liveness)
+
+#### Join
+
+(Description about the Join process, both during a master election and when a node joins a cluster with an existing
+master)
+
+#### Stateful vs Serverless
+
+(How the quorum and election process differs in Stateful vs Serverless)
+
+### Master Service
 
 #### Cluster State Publication
 
@@ -460,13 +462,11 @@ TODO
 
 (Sketch ephemeral vs persisted cluster state.)
 
-(what's the format for persisted metadata)
+(What's the format for persisted metadata)
 
-### Cluster Formation / Membership
+### New Cluster Formation
 
-(Explain joining, and how it happens every time a new master is elected)
-
-#### Discovery
+(What happens when a cluster starts from scratch)
 
 ### Master Transport Actions
 
