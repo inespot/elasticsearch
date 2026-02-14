@@ -339,7 +339,7 @@ The overall election flow looks like this:
                                                     │
                                                     ▼
     ┌───────────────────────────────────────────────┬──────────────────────────────────┐
-    │  2. Master-eligible node becomes `CANDIDATE`  │  Coordinator.becomeCandidate()   │
+    │  2. Node becomes `CANDIDATE`                  │  Coordinator.becomeCandidate()   │
     │                                               │  Mode.CANDIDATE                  │
     │  Follower transitions to `CANDIDATE` mode.    │  PeerFinder.activate(...)        │
     │  Triggers the discovery process.              │                                  │
@@ -418,7 +418,7 @@ The overall election flow looks like this:
                                                     │
                                                     ▼
     ┌───────────────────────────────────────────────┬──────────────────────────────────┐
-    │  10. Leader completes election                 │  CandidateJoinAccumulator        │
+    │  10. Leader completes election                │  CandidateJoinAccumulator        │
     │                                               │    .close(...)                   │
     │  Leader publishes state, cleans up discovery  │  JoinTask                        │
     │  connections, starts heartbeating.            │  LeaderHeartbeatService          │
@@ -432,7 +432,63 @@ The overall election flow looks like this:
 
 #### Discovery
 
-(Describe the "fast gossip" discovery process and how connections are handled)
+[PeerFinder]:https://github.com/elastic/elasticsearch/blob/main/server/src/main/java/org/elasticsearch/discovery/PeerFinder.java
+
+[PeersRequest]:https://github.com/elastic/elasticsearch/blob/main/server/src/main/java/org/elasticsearch/discovery/PeersRequest.java
+
+[PeersResponse]:https://github.com/elastic/elasticsearch/blob/main/server/src/main/java/org/elasticsearch/cluster/coordination/PeersResponse.java
+
+[SeedHostsProvider]:https://github.com/elastic/elasticsearch/blob/main/server/src/main/java/org/elasticsearch/discovery/SeedHostsProvider.java
+
+[SeedHostsResolver]:https://github.com/elastic/elasticsearch/blob/main/server/src/main/java/org/elasticsearch/discovery/SeedHostsResolver.java
+
+[SettingsBasedSeedHostsProvider]:https://github.com/elastic/elasticsearch/blob/main/server/src/main/java/org/elasticsearch/discovery/SettingsBasedSeedHostsProvider.java
+
+[FileBasedSeedHostsProvider]: https://github.com/elastic/elasticsearch/blob/main/server/src/main/java/org/elasticsearch/discovery/FileBasedSeedHostsProvider.java
+
+[AwsEc2SeedHostsProvider]: https://github.com/elastic/elasticsearch/blob/main/plugins/discovery-ec2/src/main/java/org/elasticsearch/discovery/ec2/AwsEc2SeedHostsProvider.java
+
+[DiscoveryPlugin]: https://github.com/elastic/elasticsearch/blob/main/server/src/main/java/org/elasticsearch/plugins/DiscoveryPlugin.java
+
+Discovery is a fast "gossip-like" protocol by which a node in `CANDIDATE` mode locates master-eligible nodes in the
+cluster and/or the master itself.
+A node enters `CANDIDATE` mode either on startup or after detecting a master failure. The [PeerFinder] class contains
+the core logic for the discovery process.
+
+Discovery starts with both the nodes from
+the [last accepted cluster state](https://github.com/elastic/elasticsearch/blob/v9.3.0/server/src/main/java/org/elasticsearch/cluster/coordination/Coordinator.java#L963)
+and a set of resolved seed addresses, that are obtained from the different [SeedHostsProvider] implementations:
+
+- [SettingsBasedSeedHostsProvider]: reads addresses from the `discovery.seed_hosts` config. This config is read on
+  startup and non-refreshable.
+- [FileBasedSeedHostsProvider]: reads addresses from the runtime-refreshable `unicast_hosts.txt` file in the config
+  directory. Note that because it's dynamic, using this file is usually preferred to the `discovery.seed_hosts` config.
+- Additional seed providers registered by users via the [DiscoveryPlugin]. One example of such plugin is
+  the [AwsEc2SeedHostsProvider], which uses the AWS EC2 client to find the relevant instances that could host
+  elasticsearch nodes.
+
+[SeedHostsResolver] is in charge of converting the seed hosts strings to transport addresses using DNS resolution.
+
+When discovery
+is [active](https://github.com/elastic/elasticsearch/blob/v9.3.0/server/src/main/java/org/elasticsearch/discovery/PeerFinder.java#L94), [PeerFinder]
+will
+run [handleWakeUp](https://github.com/elastic/elasticsearch/blob/v9.3.0/server/src/main/java/org/elasticsearch/discovery/PeerFinder.java#L296)
+every 1s (by default). Each iteration will clean up disconnected peers, send a [PeersRequest] to known master-eligible
+nodes (from the last accepted state and the resolved seed addresses)
+and [schedule](https://github.com/elastic/elasticsearch/blob/v9.3.0/server/src/main/java/org/elasticsearch/discovery/PeerFinder.java#L319)
+the next `handleWakeUp` iteration
+
+When [receiving](https://github.com/elastic/elasticsearch/blob/v9.3.0/server/src/main/java/org/elasticsearch/discovery/PeerFinder.java#L534)
+a [PeersResponse], PeerFinder will reach out to all peers specified in the response, including a potential master. If
+the peer node reports itself as the master and its term is greater or equal to the local one, then the node will update
+its local term
+and [try to join](https://github.com/elastic/elasticsearch/blob/v9.3.0/server/src/main/java/org/elasticsearch/cluster/coordination/Coordinator.java#L1817)
+the master.
+
+Note that discovery connections are managed separately from the regular cluster transport connections:
+they are held by the [PeerFinder] and used only during discovery. Once a master is
+found or elected, all discovery connections
+are [released](https://github.com/elastic/elasticsearch/blob/v9.3.0/server/src/main/java/org/elasticsearch/discovery/PeerFinder.java#L166).
 
 #### Pre-Vote
 
