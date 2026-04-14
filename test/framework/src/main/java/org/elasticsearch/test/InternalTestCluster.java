@@ -2571,6 +2571,7 @@ public final class InternalTestCluster extends TestCluster {
                     });
                 } catch (AssertionError e) {
                     logger.warn("Thread dump after request breaker check failure on node [{}]:\n{}", name, formatJvmThreadDump());
+                    throw e;
                 } catch (Exception e) {
                     throw new AssertionError("Exception during check for request breaker reset to 0", e);
                 }
