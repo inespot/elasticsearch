@@ -108,6 +108,8 @@ import org.elasticsearch.transport.TransportSettings;
 import java.io.Closeable;
 import java.io.IOException;
 import java.io.UncheckedIOException;
+import java.lang.management.ManagementFactory;
+import java.lang.management.ThreadInfo;
 import java.net.InetSocketAddress;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -1366,6 +1368,14 @@ public final class InternalTestCluster extends TestCluster {
 
     @Override
     public void beforeIndexDeletion() throws Exception {
+        for (InternalTestCluster.NodeAndClient nodeAndClient : nodes.values()) {
+            final CircuitBreakerService breakerService = getInstanceFromNode(CircuitBreakerService.class, nodeAndClient.node);
+            logger.info(
+                "Before index deletion REQUEST circuit breaker getUsed gives {} on node {}",
+                breakerService.getBreaker(CircuitBreaker.REQUEST).getUsed(),
+                nodeAndClient.name
+            );
+        }
         // Check that the operations counter on index shard has reached 0.
         // The assumption here is that after a test there are no ongoing write operations.
         // test that have ongoing write operations after the test (for example because ttl is used
@@ -2519,7 +2529,16 @@ public final class InternalTestCluster extends TestCluster {
 
     @Override
     public void ensureEstimatedStats() {
+        logger.info("---> Ensure estimated stats");
+        for (NodeAndClient nodeAndClient : nodes.values()) {
+            final CircuitBreakerService breakerService = getInstanceFromNode(CircuitBreakerService.class, nodeAndClient.node);
+            logger.info(
+                "---> Before waiting for async tasks: REQUEST circuit break getUsed is {}",
+                breakerService.getBreaker(CircuitBreaker.REQUEST).getUsed()
+            );
+        }
         if (size() > 0) {
+            logger.info("---> Finished waiting for async task to complete");
             awaitIndexShardCloseAsyncTasks();
             // Checks that the breakers have been reset without incurring a
             // network request, because a network request can increment one
@@ -2546,8 +2565,12 @@ public final class InternalTestCluster extends TestCluster {
                 try {
                     assertBusy(() -> {
                         CircuitBreaker reqBreaker = breakerService.getBreaker(CircuitBreaker.REQUEST);
-                        assertThat("Request breaker not reset to 0 on node: " + name, reqBreaker.getUsed(), equalTo(0L));
+                        final var used = reqBreaker.getUsed();
+                        logger.info("--> REQUEST circuit breaker getUsed is {} on node {}", used, name);
+                        assertThat("Request breaker not reset to 0 on node: " + name, used, equalTo(0L));
                     });
+                } catch (AssertionError e) {
+                    logger.warn("Thread dump after request breaker check failure on node [{}]:\n{}", name, formatJvmThreadDump());
                 } catch (Exception e) {
                     throw new AssertionError("Exception during check for request breaker reset to 0", e);
                 }
@@ -2656,6 +2679,26 @@ public final class InternalTestCluster extends TestCluster {
         for (NodeAndClient nodeAndClient : nodes.values()) {
             ESTestCase.ensureAllContextsReleased(getInstance(SearchService.class, nodeAndClient.name));
         }
+    }
+
+    private static String formatJvmThreadDump() {
+        StringBuilder b = new StringBuilder();
+        for (ThreadInfo ti : ManagementFactory.getThreadMXBean().dumpAllThreads(true, true)) {
+            if (ti != null) {
+                b.append('"')
+                    .append(ti.getThreadName())
+                    .append("\" Id=")
+                    .append(ti.getThreadId())
+                    .append(' ')
+                    .append(ti.getThreadState())
+                    .append('\n');
+                for (StackTraceElement ste : ti.getStackTrace()) {
+                    b.append("\tat ").append(ste).append('\n');
+                }
+                b.append('\n');
+            }
+        }
+        return b.toString();
     }
 
     public void awaitIndexShardCloseAsyncTasks() {
