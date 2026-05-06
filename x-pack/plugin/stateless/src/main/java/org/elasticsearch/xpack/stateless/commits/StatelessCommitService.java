@@ -2558,6 +2558,7 @@ public class StatelessCommitService extends AbstractLifecycleComponent implement
             Set<PrimaryTermAndGeneration> notificationCommitBCCDependencies,
             Set<PrimaryTermAndGeneration> primaryTermAndGenerationsInUse
         ) {
+            logger.info("----> onNewUploadedCommitNotificationResponse, bcc {}, commit {}", bccNotificationGeneration, commitNotificationGeneration);
             if (state == State.CLOSED) {
                 return;
             }
@@ -3094,6 +3095,7 @@ public class StatelessCommitService extends AbstractLifecycleComponent implement
                     if (previousSearchNodes != null && previousSearchNodes.isEmpty()) {
                         assert searchNodesRef.get() == null;
                         logger.trace(() -> Strings.format("[%s] closing external readers [%s]", shardId, primaryTermAndGeneration));
+                        logger.info("-----> Dec ref, bcc {}", bccNotificationGeneration);
                         decRef();
                     }
                 }
@@ -3212,6 +3214,7 @@ public class StatelessCommitService extends AbstractLifecycleComponent implement
                     var commitReferencesInfo = commitReferencesInfos.remove(commitPrimaryTermAndGeneration);
                     assert commitReferencesInfo != null : commitPrimaryTermAndGeneration + " " + commitReferencesInfos;
                 });
+
 
                 commitCleaner.deleteCommit(new StaleCompoundCommit(shardId, primaryTermAndGeneration, allocationPrimaryTerm));
                 var removed = primaryTermAndGenToBlobReference.remove(primaryTermAndGeneration);

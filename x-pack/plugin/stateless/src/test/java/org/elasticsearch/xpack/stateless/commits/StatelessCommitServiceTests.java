@@ -945,6 +945,7 @@ public class StatelessCommitServiceTests extends ESTestCase {
         var commitCleaner = new StatelessCommitCleaner(null, null, mock(ObjectStoreService.class)) {
             @Override
             protected void deleteCommit(StaleCompoundCommit staleCompoundCommit) {
+                logger.info("----> delete commit {}", staleCompoundCommit.primaryTermAndGeneration());
                 deletedCommits.add(staleCompoundCommit);
             }
         };
@@ -997,7 +998,9 @@ public class StatelessCommitServiceTests extends ESTestCase {
             var mergedCommit = testHarness.generateIndexCommits(1, true, false, generation -> {}).get(0);
             commitService.onCommitCreation(mergedCommit);
             commitService.ensureMaxGenerationToUploadForFlush(shardId, mergedCommit.getGeneration());
+            logger.info("--> Before wait until waitUntilBCCIsUploaded is uploaded");
             waitUntilBCCIsUploaded(commitService, shardId, mergedCommit.getGeneration());
+            logger.info("--> After waitUntilBCCIsUploaded is uploaded");
 
             markDeletedAndLocalUnused(List.of(mergedCommit), initialCommits, commitService, shardId);
 
@@ -1011,12 +1014,15 @@ public class StatelessCommitServiceTests extends ESTestCase {
                 new PrimaryTermAndGeneration(primaryTerm, firstCommit.getGeneration()),
                 new PrimaryTermAndGeneration(mergedCommit.getPrimaryTerm(), mergedCommit.getGeneration())
             );
+            logger.info("--> After respondWithUsedCommitsToUploadNotify");
 
             var expectedDeletedCommits = initialCommits.stream()
                 .map(commit -> staleCommit(shardId, commit))
                 .filter(commit -> commit.primaryTermAndGeneration().generation() != firstCommit.getGeneration())
                 .collect(Collectors.toSet());
+            logger.info("--> Assert deleted commits");
             assertThat(deletedCommits, equalTo(expectedDeletedCommits));
+            logger.info("--> Finished test");
         }
     }
 

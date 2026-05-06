@@ -107,15 +107,24 @@ public class StatelessCommitNotificationPublisher {
             );
             assert notificationRequest.isUploaded();
 
+            logger.info("----> Sending TransportNewCommitNotificationAction request, bcc {}", uploadedBcc.primaryTermAndGeneration());
             client.execute(
                 TransportNewCommitNotificationAction.TYPE,
                 notificationRequest,
                 listeners.acquire(response -> newCommitNotificationResponse.set(response.getPrimaryTermAndGenerationsInUse()))
             );
 
+            logger.info("----> Sent TransportNewCommitNotificationAction request, bcc {}", uploadedBcc.primaryTermAndGeneration());
             if (oldSearchNodesRetainingCommits.isEmpty()) {
                 // Not running the Fetch action, no old search nodes to which to send requests.
                 fetchShardCommitsInUseResponse.set(Set.of());
+                // race repro, see issue #147888
+                try {
+                    Thread.sleep(200);
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                }
+                logger.info("----> return from sendNewUploadedCommitNotificationAndFetchInUseCommits, bcc {}", uploadedBcc.primaryTermAndGeneration());
                 return;
             }
 
