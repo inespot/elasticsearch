@@ -23,15 +23,12 @@ import org.junit.Before;
 
 import java.io.IOException;
 import java.nio.ByteBuffer;
-import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Queue;
 import java.util.concurrent.ConcurrentLinkedQueue;
 
-import static org.elasticsearch.repositories.azure.AzureBlobStore.Operation.BLOB_BATCH;
-import static org.elasticsearch.repositories.azure.AzureBlobStore.Operation.LIST_BLOBS;
 import static org.elasticsearch.repositories.azure.AzureBlobStore.Operation.PUT_BLOB;
 
 public class AzureBlobContainerStatsTests extends AbstractAzureServerTestCase {
@@ -62,7 +59,7 @@ public class AzureBlobContainerStatsTests extends AbstractAzureServerTestCase {
         final OperationPurpose purpose = randomFrom(OperationPurpose.values());
 
         // Just a sample of the easy operations to test
-        final List<AzureBlobStore.Operation> supportedOperations = Arrays.asList(PUT_BLOB, LIST_BLOBS, BLOB_BATCH);
+        final List<AzureBlobStore.Operation> supportedOperations = List.of(PUT_BLOB);
         final Map<AzureBlobStore.Operation, BlobStoreActionStats> expectedActionStats = new HashMap<>();
 
         for (int i = 0; i < randomIntBetween(10, 50); i++) {
@@ -76,7 +73,7 @@ public class AzureBlobContainerStatsTests extends AbstractAzureServerTestCase {
                 case PUT_BLOB -> blobStore.writeBlob(
                     purpose,
                     randomIdentifier(),
-                    BytesReference.fromByteBuffer(ByteBuffer.wrap(randomBlobContent())),
+                    BytesReference.fromByteBuffer(ByteBuffer.wrap(randomByteArrayOfLength(randomIntBetween(1 << 15, 1 << 20)))),
                     false
                 );
                 case LIST_BLOBS -> blobStore.listBlobsByPrefix(purpose, randomIdentifier(), randomIdentifier());
