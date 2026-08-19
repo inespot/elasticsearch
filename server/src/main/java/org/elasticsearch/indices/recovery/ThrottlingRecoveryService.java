@@ -67,7 +67,7 @@ public final class ThrottlingRecoveryService extends AbstractLifecycleComponent 
         // Throttling handled by master allocation for now.
         Integer.MAX_VALUE,
         1,
-        Setting.Property.Dynamic,
+        Setting.Property.OperatorDynamic,
         Setting.Property.NodeScope
     );
 
@@ -201,7 +201,7 @@ public final class ThrottlingRecoveryService extends AbstractLifecycleComponent 
             }
             return;
         }
-        logger.trace("enqueued recovery: {}", recoveryState);
+        logger.trace("enqueued recovery: {}, current queue size {}", recoveryState, currentQueueSize());
         schedulingListener.onRecoveryQueuedOnTarget(recoveryState.getRecoverySource().getType(), pendingRecovery.priorityGroup());
         fillSlots();
     }
@@ -402,7 +402,7 @@ public final class ThrottlingRecoveryService extends AbstractLifecycleComponent 
             try (var ignored = recovery.context.get()) {
                 executor.execute(new RecoveryRunnable(recovery, wrapped));
             }
-            logger.trace("dispatched recovery: {}", recovery.recoveryState());
+            logger.trace("dispatched recovery: {}, current queue size {}", recovery.recoveryState(), currentQueueSize());
             schedulingListener.onRecoveryDequeuedAndStartedOnTarget(
                 recovery.recoveryState().getRecoverySource().getType(),
                 recovery.priorityGroup()

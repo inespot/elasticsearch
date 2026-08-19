@@ -36,7 +36,7 @@ public final class RecoveryGateMonitor {
     public static final Setting<Boolean> ENABLE_RECOVERY_GATES_SETTING = Setting.boolSetting(
         "indices.recovery.gates.enabled",
         false,
-        Setting.Property.Dynamic,
+        Setting.Property.OperatorDynamic,
         Setting.Property.NodeScope
     );
 

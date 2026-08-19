@@ -9,7 +9,6 @@
 package org.elasticsearch.test;
 
 import org.elasticsearch.cluster.metadata.IndexMetadata;
-import org.elasticsearch.cluster.routing.allocation.RecoveryDirectCancellationService;
 import org.elasticsearch.common.settings.Setting;
 import org.elasticsearch.common.settings.Setting.Property;
 import org.elasticsearch.core.TimeValue;
@@ -17,8 +16,6 @@ import org.elasticsearch.index.IndexModule;
 import org.elasticsearch.index.IndexService;
 import org.elasticsearch.index.IndexSettings;
 import org.elasticsearch.index.engine.EngineConfig;
-import org.elasticsearch.indices.recovery.PeerRecoverySourceService;
-import org.elasticsearch.indices.recovery.RecoveryGateMonitor;
 import org.elasticsearch.indices.recovery.ThrottlingRecoveryService;
 import org.elasticsearch.monitor.fs.FsService;
 import org.elasticsearch.plugins.Plugin;
@@ -76,11 +73,7 @@ public final class InternalSettingsPlugin extends Plugin {
             IndexSettings.FILE_BASED_RECOVERY_THRESHOLD_SETTING,
             IndexModule.INDEX_QUERY_CACHE_EVERYTHING_SETTING,
             FsService.ALWAYS_REFRESH_SETTING,
-            PeerRecoverySourceService.INDICES_RECOVERY_MAX_CONCURRENT_OUTGOING_RECOVERIES_SETTING,
-            ThrottlingRecoveryService.INDICES_RECOVERY_MAX_CONCURRENT_RECOVERIES_SETTING,
-            ThrottlingRecoveryService.INDICES_RECOVERY_MAX_CONCURRENT_RELOCATION_RECOVERIES_SETTING,
-            RecoveryDirectCancellationService.ENABLE_DIRECT_RECOVERY_CANCELLATIONS_SETTING,
-            RecoveryGateMonitor.ENABLE_RECOVERY_GATES_SETTING
+            ThrottlingRecoveryService.INDICES_RECOVERY_MAX_CONCURRENT_RELOCATION_RECOVERIES_SETTING
         );
     }
 }
