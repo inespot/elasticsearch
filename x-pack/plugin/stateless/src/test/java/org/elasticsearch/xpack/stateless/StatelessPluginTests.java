@@ -11,6 +11,7 @@ import org.elasticsearch.cluster.routing.allocation.DiskThresholdSettings;
 import org.elasticsearch.common.breaker.CircuitBreaker;
 import org.elasticsearch.common.breaker.NoopCircuitBreaker;
 import org.elasticsearch.common.settings.Settings;
+import org.elasticsearch.indices.recovery.ThrottlingRecoveryService;
 import org.elasticsearch.license.License;
 import org.elasticsearch.license.XPackLicenseState;
 import org.elasticsearch.license.internal.XPackLicenseStatus;
@@ -149,6 +150,16 @@ public class StatelessPluginTests extends ESTestCase {
 
         // setCircuitBreaker must accept a breaker whose name matches; an unrelated breaker would trip the assert.
         plugin.setCircuitBreaker(new NoopCircuitBreaker(StatelessReaderHeapBreaker.NAME));
+    }
+
+    public void testThrottlingRecoverySettingsAreRegistered() {
+        final var settings = Settings.builder()
+            .put(STATELESS_ENABLED.getKey(), true)
+            .put(NodeRoleSettings.NODE_ROLES_SETTING.getKey(), DiscoveryNodeRole.INDEX_ROLE.roleName())
+            .build();
+        final var plugin = createStatelessPlugin(settings);
+
+        assertTrue(plugin.getSettings().contains(ThrottlingRecoveryService.INDICES_RECOVERY_MAX_CONCURRENT_RECOVERIES_SETTING));
     }
 
     public void testDataStreamLifecycleSettings() throws Exception {

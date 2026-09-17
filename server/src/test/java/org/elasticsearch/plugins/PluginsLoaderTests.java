@@ -11,14 +11,20 @@ package org.elasticsearch.plugins;
 
 import org.apache.lucene.tests.util.LuceneTestCase;
 import org.elasticsearch.Build;
+import org.elasticsearch.common.settings.Setting;
 import org.elasticsearch.common.settings.Settings;
 import org.elasticsearch.env.Environment;
 import org.elasticsearch.env.TestEnvironment;
+import org.elasticsearch.indices.recovery.ThrottlingRecoveryService;
 import org.elasticsearch.logging.LogManager;
 import org.elasticsearch.logging.Logger;
 import org.elasticsearch.nativeaccess.NativeAccessUtil;
+import org.elasticsearch.node.InternalSettingsPreparer;
+import org.elasticsearch.node.MockNode;
+import org.elasticsearch.node.Node;
 import org.elasticsearch.plugin.analysis.CharFilterFactory;
 import org.elasticsearch.test.ESTestCase;
+import org.elasticsearch.test.MockHttpTransport;
 import org.elasticsearch.test.compiler.InMemoryJavaCompiler;
 import org.elasticsearch.test.jar.JarUtils;
 
@@ -27,11 +33,14 @@ import java.io.UncheckedIOException;
 import java.net.URLClassLoader;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
 import static java.util.Map.entry;
 import static org.elasticsearch.test.hamcrest.OptionalMatchers.isPresent;
+import static org.hamcrest.Matchers.containsString;
+import static org.hamcrest.Matchers.empty;
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.hasSize;
 import static org.hamcrest.Matchers.instanceOf;
@@ -46,6 +55,16 @@ public class PluginsLoaderTests extends ESTestCase {
     public static final String STABLE_PLUGIN_MODULE_NAME = "synthetic.stable.plugin";
     public static final String MODULAR_PLUGIN_NAME = "modular-plugin";
     public static final String MODULAR_PLUGIN_MODULE_NAME = "modular.plugin";
+
+    public static class StatelessOnlySettingsPlugin extends Plugin {
+        @Override
+        public List<Setting<?>> getSettings() {
+            return List.of(
+                Setting.boolSetting("stateless.enabled", false, Setting.Property.NodeScope),
+                ThrottlingRecoveryService.INDICES_RECOVERY_MAX_CONCURRENT_RECOVERIES_SETTING
+            );
+        }
+    }
 
     static PluginsLoader newPluginsLoader(Settings settings) {
         return PluginsLoader.createPluginsLoader(
@@ -68,6 +87,75 @@ public class PluginsLoaderTests extends ESTestCase {
         assertThat(PluginsLoader.toModuleName("-module-name-"), equalTo("module.name"));
         assertThat(PluginsLoader.toModuleName("_module_name"), equalTo("_module_name"));
         assertThat(PluginsLoader.toModuleName("_"), equalTo("_"));
+    }
+
+    public void testStatelessOnlySettingInElasticsearchYmlFailsOnStatefulNode() throws IOException {
+        final var home = createTempDir();
+        final var setting = ThrottlingRecoveryService.INDICES_RECOVERY_MAX_CONCURRENT_RECOVERIES_SETTING;
+        final var configDirectory = home.resolve("config");
+        Files.createDirectories(configDirectory);
+        Files.writeString(configDirectory.resolve("elasticsearch.yml"), setting.getKey() + ": 1\n");
+
+        final var settings = Settings.builder().put(Environment.PATH_HOME_SETTING.getKey(), home).build();
+        createStatelessOnlyPlugin(home);
+
+        final var statefulPlugins = PluginsLoader.loadPluginsBundles(TestEnvironment.newEnvironment(settings).pluginsDir(), false);
+        assertThat(statefulPlugins, empty());
+
+        final var environment = InternalSettingsPreparer.prepareEnvironment(settings, Map.of(), null, () -> "stateful-node");
+        final var pluginsLoader = PluginsLoader.createPluginsLoader(Set.of(), statefulPlugins, Map.of(), false);
+        final var exception = expectThrows(IllegalArgumentException.class, () -> new Node(environment, pluginsLoader));
+        final var exception2 = expectThrows(
+            IllegalArgumentException.class,
+            () -> new MockNode(settings, List.of(getTestTransportPlugin(), MockHttpTransport.TestPlugin.class))
+        );
+        assertThat(exception.getMessage(), containsString("unknown setting [" + setting.getKey() + "]"));
+        assertThat(exception2.getMessage(), containsString("unknown setting [" + setting.getKey() + "]"));
+    }
+
+    public void testStatelessOnlySettingInElasticsearchYmlIsAcceptedOnStatelessNode() throws IOException {
+        final var home = createTempDir();
+        final var setting = ThrottlingRecoveryService.INDICES_RECOVERY_MAX_CONCURRENT_RECOVERIES_SETTING;
+        final var configDirectory = home.resolve("config");
+        Files.createDirectories(configDirectory);
+        Files.writeString(configDirectory.resolve("elasticsearch.yml"), """
+            stateless.enabled: true
+            node.roles: index
+            %s: 1
+            """.formatted(setting.getKey()));
+
+        final var settings = Settings.builder().put(Environment.PATH_HOME_SETTING.getKey(), home).build();
+        createStatelessOnlyPlugin(home);
+        try (
+            final var node = new MockNode(
+                settings,
+                List.of(StatelessOnlySettingsPlugin.class, getTestTransportPlugin(), MockHttpTransport.TestPlugin.class)
+            )
+        ) {
+            assertThat(node.settings().get(setting.getKey()), equalTo("1"));
+        }
+    }
+
+    private static void createStatelessOnlyPlugin(Path home) throws IOException {
+        final var plugin = home.resolve("plugins").resolve("stateless-only-plugin");
+        Files.createDirectories(plugin);
+        PluginTestUtil.writePluginProperties(
+            plugin,
+            "description",
+            "description",
+            "name",
+            "stateless-only-plugin",
+            "classname",
+            "p.A",
+            "version",
+            "1.0.0",
+            "elasticsearch.version",
+            Build.current().version(),
+            "java.version",
+            System.getProperty("java.specification.version"),
+            "deployment.target",
+            "STATELESS_ONLY"
+        );
     }
 
     public void testStablePluginLoading() throws Exception {
