@@ -111,6 +111,10 @@ public class PluginsLoaderTests extends ESTestCase {
         );
         assertThat(exception.getMessage(), containsString("unknown setting [" + setting.getKey() + "]"));
         assertThat(exception2.getMessage(), containsString("unknown setting [" + setting.getKey() + "]"));
+        Files.writeString(configDirectory.resolve("elasticsearch.yml"), "cluster.routing.allocation.allow_rebalance: indices_all_active");
+        try (var node = new MockNode(settings, List.of(getTestTransportPlugin(), MockHttpTransport.TestPlugin.class))) {
+            assertThat(node.settings().get("cluster.routing.allocation.allow_rebalance"), equalTo("indices_all_active"));
+        }
     }
 
     public void testStatelessOnlySettingInElasticsearchYmlIsAcceptedOnStatelessNode() throws IOException {
