@@ -909,14 +909,14 @@ public class IndicesClusterStateService extends AbstractLifecycleComponent imple
 
     private void createShard(ShardRouting shardRouting, ClusterState state) {
         assert shardRouting.initializing() : "only allow shard creation for initializing shard but was " + shardRouting;
-        final var shardId = shardRouting.shardId();
+        final ShardId shardId = shardRouting.shardId();
         final ProjectMetadata project = state.metadata().lookupProject(shardRouting.index()).orElse(null);
         assert project != null : "null index project but non-null shard routing " + shardRouting;
         final IndexMetadata indexMetadata = project.index(shardId.getIndex());
         assert indexMetadata != null : "null index metadata but non-null shard routing " + shardRouting;
-        final var primaryTerm = indexMetadata.primaryTerm(shardRouting.id());
-        final var retryKey = new RetryKey(shardId, shardRouting.allocationId().getId());
-        final var localRecoveryRetries = retryingShards.getOrDefault(retryKey, 0);
+        final long primaryTerm = indexMetadata.primaryTerm(shardRouting.id());
+        final RetryKey retryKey = new RetryKey(shardId, shardRouting.allocationId().getId());
+        final int localRecoveryRetries = retryingShards.getOrDefault(retryKey, 0);
 
         try {
             final DiscoveryNode sourceNode;
@@ -1355,12 +1355,41 @@ public class IndicesClusterStateService extends AbstractLifecycleComponent imple
         Exception failure,
         RecoveryState recoveryState
     ) {
-        // If local recovery retry is not enabled or recovery source is RESHARD_SPLIT we notify the master instead.
-        // TODO: Remove RESHARD_SPLIT exclusion once local retries support it
-        FailureStrategy finalStrategy = failureStrategy.equals(FailureStrategy.RETRY)
-            && (localRecoveryRetryEnabled == false || shardRouting.recoverySource().getType().equals(Type.RESHARD_SPLIT))
-                ? FailureStrategy.FAIL_SEND
-                : failureStrategy;
+        final Shard shard = indicesService.getShardOrNull(shardRouting.shardId());
+        final IndexShardState shardState = shard != null && shard.routingEntry().isSameAllocation(shardRouting) ? shard.state() : null;
+
+        if (failureStrategy != FailureStrategy.FAIL_SEND) {
+            // In both of the below cases, we are a late notification that got superseded by the cluster state application,
+            // or a concurrent failure. Our work is done here.
+            if (shardState == null || shardState == IndexShardState.CLOSED) {
+                return;
+            }
+            final var retryKey = new RetryKey(shardRouting.shardId(), shardRouting.allocationId().getId());
+            final Integer existingMarker = retryingShards.get(retryKey);
+            if (existingMarker != null && existingMarker.intValue() > recoveryState.getLocalRetries()) {
+                return;
+            }
+        }
+
+        final FailureStrategy finalStrategy;
+        if (failureStrategy != FailureStrategy.RETRY) {
+            finalStrategy = failureStrategy;
+        } else if (localRecoveryRetryEnabled == false) {
+            // local recovery retry is disabled
+            finalStrategy = FailureStrategy.FAIL_SEND;
+        } else if (shardState != IndexShardState.RECOVERING) {
+            // When the shard reaches POST_RECOVERY, updateShard may have sent a started notification even if routing is
+            // still initializing. In which case the master could respond with a `STARTED` update, and we could continue
+            // retrying locally without ever letting the master know that the shard is back in INITIALIZING.
+            // Fall back to FAIL_SEND in this case.
+            finalStrategy = FailureStrategy.FAIL_SEND;
+        } else if (shardRouting.recoverySource().getType().equals(Type.RESHARD_SPLIT)) {
+            // TODO: Remove RESHARD_SPLIT exclusion once local retries support it
+            finalStrategy = FailureStrategy.FAIL_SEND;
+        } else {
+            finalStrategy = FailureStrategy.RETRY;
+        }
+
         try {
             CloseUtils.executeDirectly(
                 l -> failAndRemoveShard(
@@ -1479,22 +1508,17 @@ public class IndicesClusterStateService extends AbstractLifecycleComponent imple
         if (currentRouting == null
             || currentRouting.allocationId().getId().equals(retryAllocationId) == false
             || currentRouting.initializing() == false) {
-            logger.debug(
-                "{} retry shard context is obsolete: old allocationId [{}], new routing [{}]",
-                shardId,
-                retryAllocationId,
-                currentRouting
-            );
+            logger.debug("{} retrying shard marker is obsolete: retry marker [{}], new routing [{}]", shardId, retryMarker, currentRouting);
             return true;
         }
 
         // Shard failure has been sent to master, but local cluster state doesn't reflect it yet.
         // Don't retry recovery on a shard that will be removed by master.
-        if (failedShardsCache.containsKey(shardId)) {
-            logger.debug("{} retry shard context is obsolete: shard failure was sent to master", shardId);
+        final FailedShardCacheEntry failedShardEntry = failedShardsCache.get(shardId);
+        if (failedShardEntry != null && failedShardEntry.routing().allocationId().getId().equals(retryAllocationId)) {
+            logger.debug("{} retrying shard marker is obsolete: shard failure was sent to master: retry marker [{}]", shardId, retryMarker);
             return true;
         }
-
         return false;
     }
 
